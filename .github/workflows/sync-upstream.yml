@@ -1,0 +1,46 @@
+name: Sync upstream
+
+# 每 6 小时自动同步 THU-MAIC/OpenMAIC 官方 main 到本 fork。
+# 有更新 → merge + push → 自动触发 build-image workflow 重建镜像。
+# 冲突时 job 失败（邮件通知），旧镜像继续运行，需人工介入。
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Merge upstream main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git remote add upstream https://github.com/THU-MAIC/OpenMAIC.git
+          git fetch upstream main --tags
+          if git diff --quiet HEAD upstream/main; then
+            echo "No upstream changes"
+            exit 0
+          fi
+          git config user.name "vstlight"
+          git config user.email "vstlight@users.noreply.github.com"
+          if git merge --no-edit upstream/main; then
+            git push origin main
+            echo "Synced to upstream/main"
+          else
+            echo "::error::Merge conflict with upstream — resolve manually"
+            exit 1
+          fi
