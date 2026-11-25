@@ -1,7 +1,10 @@
 import type { PPTElement, RuntimeRecord, Whiteboard } from '@openmaic/dsl';
 import { describe, expect, it } from 'vitest';
 
-import { foldWhiteboardRuntimeRecords } from '@/lib/whiteboard/runtime/fold';
+import {
+  foldWhiteboardRuntimeRecords,
+  foldWhiteboardRuntimeRecordsWithHistory,
+} from '@/lib/whiteboard/runtime/fold';
 import {
   LEGACY_WHITEBOARD_SOURCE_KIND,
   WHITEBOARD_RUNTIME_PAYLOAD_VERSION,
@@ -600,6 +603,32 @@ describe('whiteboard RuntimeStore payload contract', () => {
 });
 
 describe('whiteboard RuntimeStore fold', () => {
+  it('captures immutable pre-clear pages without changing replay or duplicate semantics', async () => {
+    const clear = operationPayload('clear:one', { kind: 'elements_cleared' });
+    const records = [
+      record(0, elementPayload()),
+      record(1, clear),
+      record(2, elementPayload('add:two', textElement('second', 'second page'))),
+      record(3, clear), // Exact duplicate: must not clear or archive the second page.
+      record(4, operationPayload('clear:two', { kind: 'elements_cleared' })),
+      record(5, elementPayload('add:three', textElement('third', 'current page'))),
+    ];
+    const { state, pages } = await foldWhiteboardRuntimeRecordsWithHistory('session-1', records);
+    expect(state).toEqual(await foldWhiteboardRuntimeRecords('session-1', records));
+    expect(pages.map((p) => p.beforeClearSeq)).toEqual([0, 3]);
+    expect(pages[0].whiteboard.elements).toEqual([textElement()]);
+    expect(pages[1].whiteboard.elements).toEqual([textElement('second', 'second page')]);
+    expect(state.whiteboard?.elements).toEqual([textElement('third', 'current page')]);
+    expect(Object.isFrozen(pages[0].whiteboard.elements[0])).toBe(true);
+    expect((await foldWhiteboardRuntimeRecordsWithHistory('session-1', [])).pages).toEqual([]);
+    await expect(foldWhiteboardRuntimeRecordsWithHistory('session-1', [record(1)])).rejects.toThrow(
+      'WHITEBOARD_RUNTIME_RECORD_SEQUENCE_INVALID',
+    );
+    await expect(
+      foldWhiteboardRuntimeRecordsWithHistory('session-1', [record(0, clear)]),
+    ).rejects.toThrow('whiteboard_missing');
+  });
+
   it('folds an empty session shell without inventing state', async () => {
     await expect(foldWhiteboardRuntimeRecords('session-1', [])).resolves.toMatchObject({
       sessionId: 'session-1',
@@ -726,7 +755,7 @@ describe('whiteboard RuntimeStore fold', () => {
     expect(cleared.whiteboard).not.toBeNull();
   });
 
-  it('matches Legacy line-edit ordering while preserving host replacement IDs and code metadata', async () => {
+  it('anchors replacement at the earliest document line while preserving host IDs and code metadata', async () => {
     const imported = payload({
       operation: {
         ...payload().operation,
@@ -760,11 +789,11 @@ describe('whiteboard RuntimeStore fold', () => {
       showLineNumbers: true,
       fontSize: 14,
       lines: [
-        { id: 'L2', content: 'const two = 2;' },
-        { id: 'L4', content: '' },
         { id: 'host-A', content: '' },
         { id: 'host-B', content: 'two' },
         { id: 'host-C', content: 'three' },
+        { id: 'L2', content: 'const two = 2;' },
+        { id: 'L4', content: '' },
       ],
     });
   });

@@ -55,6 +55,46 @@ describe('loader semantics', () => {
     expect(`${result!.system}\n${result!.user}`).not.toMatch(/\{\{\w[\w-]*\}\}/);
   });
 
+  test('inlines the TTS readability snippet into every actions prompt', () => {
+    const actionsPromptIds = [
+      PROMPT_IDS.SLIDE_ACTIONS,
+      PROMPT_IDS.QUIZ_ACTIONS,
+      PROMPT_IDS.INTERACTIVE_ACTIONS,
+      PROMPT_IDS.PBL_ACTIONS,
+    ];
+
+    for (const promptId of actionsPromptIds) {
+      const prompt = loadPrompt(promptId);
+      expect(prompt, promptId).not.toBeNull();
+      expect(prompt!.systemPrompt, promptId).toContain('Speech Must Be TTS-Readable');
+      expect(prompt!.systemPrompt, promptId).not.toMatch(/\{\{snippet:/);
+    }
+  });
+
+  test('inlines the display-state rules into every interactive content prompt', () => {
+    const interactivePromptIds = [
+      PROMPT_IDS.SIMULATION_CONTENT,
+      PROMPT_IDS.DIAGRAM_CONTENT,
+      PROMPT_IDS.CODE_CONTENT,
+      PROMPT_IDS.GAME_CONTENT,
+      PROMPT_IDS.VISUALIZATION3D_CONTENT,
+      PROMPT_IDS.PROCEDURAL_SKILL_CONTENT,
+    ];
+
+    for (const promptId of interactivePromptIds) {
+      const prompt = loadPrompt(promptId);
+      expect(prompt, promptId).not.toBeNull();
+      const system = prompt!.systemPrompt;
+      expect(
+        system.split('## REQUIRED: what the page shows must match its state'),
+        promptId,
+      ).toHaveLength(2);
+      expect(system, promptId).toContain(
+        '[hidden]:not([hidden="until-found"]) { display: none !important; }',
+      );
+    }
+  });
+
   test('inlines a snippet exactly once', () => {
     const promptsDir = createPromptsFixture();
     writeFileSync(join(promptsDir, 'snippets', 'example.md'), 'inlined content\n');

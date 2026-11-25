@@ -14,7 +14,19 @@ import type {
   SlideContent,
 } from '@openmaic/dsl';
 import puppeteer from 'puppeteer-core';
-import type { Browser, Frame, Page } from 'puppeteer-core';
+import type { Browser, Frame, HTTPRequest, Page } from 'puppeteer-core';
+import {
+  hostedInteractiveLibraries,
+  INTERACTIVE_PREVIEW_ORIGIN,
+  type HostedInteractiveLibraries,
+} from './hosted-interactive-libraries.js';
+import { katexPreviewStylesheet } from './preview-katex.js';
+import { UNTRUSTED_HTML_CSP, injectUntrustedHtmlCsp } from './untrusted-html-csp.js';
+import {
+  collectInteractiveRuntimeErrors,
+  replayInteractiveActions,
+  type InteractiveRuntimeError,
+} from './interactive-runtime.js';
 
 export type PreviewScene = Scene<
   Action,
@@ -44,6 +56,10 @@ export interface PreviewRenderer {
   render(request: PreviewRequest): Promise<Uint8Array>;
 }
 
+export type InteractiveRuntimeRequest = PreviewRequest & {
+  scene: Extract<PreviewScene, { type: 'interactive' }>;
+};
+
 export class PreviewTimeoutError extends Error {}
 
 const PREVIEW_PROTOCOL_TIMEOUT_BUFFER_MS = 1_000;
@@ -57,9 +73,15 @@ function escapeAttribute(value: string): string {
     .replaceAll('>', '&gt;');
 }
 
-function htmlDocument(body: string, scene: PreviewScene): string {
+/** The stylesheet text is trusted (read from the installed KaTeX package). */
+function htmlDocument(
+  body: string,
+  scene: PreviewScene,
+  headStyles = '',
+  baseUrl?: string,
+): string {
   return `<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>*{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;overflow:hidden}</style></head>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">${baseUrl ? `<base href="${escapeAttribute(baseUrl)}">` : ''}<style>*{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;overflow:hidden}</style>${headStyles ? `<style data-preview-katex>${headStyles}</style>` : ''}</head>
 <body data-scene-id="${escapeAttribute(scene.id)}">${body}</body></html>`;
 }
 
@@ -135,6 +157,25 @@ export function injectInteractiveStorageShim(html: string): string {
   return injectIntoDocumentHead(html, `\n${STORAGE_SHIM}\n`);
 }
 
+/**
+ * Build the interactive `srcDoc`: the CSP `<meta>` first, then the storage
+ * shim. The policy must be processed before any authored script, including one
+ * placed before `<head>` or before `<html>`.
+ */
+export function buildInteractiveSrcDoc(html: string, policy = UNTRUSTED_HTML_CSP): string {
+  return injectInteractiveStorageShim(injectUntrustedHtmlCsp(html, policy));
+}
+
+function interactiveRuntimePolicy(libraries: HostedInteractiveLibraries): string {
+  return UNTRUSTED_HTML_CSP.split('; ')
+    .map((directive) =>
+      /^(script|style|font|img|media)-src /.test(directive)
+        ? `${directive} ${libraries.bases.join(' ')}`
+        : directive,
+    )
+    .join('; ');
+}
+
 function slidePreviewMarkup(
   _scene: Extract<PreviewScene, { type: 'slide' }>,
   viewport: PreviewViewport,
@@ -150,12 +191,16 @@ function slidePreviewMarkup(
 function interactivePreviewMarkup(
   scene: Extract<PreviewScene, { type: 'interactive' }>,
   viewport: PreviewViewport,
+  libraries?: HostedInteractiveLibraries,
 ): string {
   if (!scene.content.html) throw new Error('Interactive page has no embedded HTML to preview');
   return renderToStaticMarkup(
     createElement('iframe', {
       title: scene.title,
-      srcDoc: injectInteractiveStorageShim(scene.content.html),
+      srcDoc: buildInteractiveSrcDoc(
+        scene.content.html,
+        libraries && interactiveRuntimePolicy(libraries),
+      ),
       sandbox: 'allow-scripts allow-forms allow-modals',
       style: { width: `${viewport.width}px`, height: `${viewport.height}px`, border: 0 },
     }),
@@ -225,14 +270,23 @@ export function buildPreviewHtml(
   scene: PreviewScene,
   stage: PreviewStageContext,
   viewport: PreviewViewport,
+  libraries?: HostedInteractiveLibraries,
 ): string {
   const markup =
     scene.type === 'slide'
       ? slidePreviewMarkup(scene, viewport)
       : scene.type === 'interactive'
-        ? interactivePreviewMarkup(scene, viewport)
+        ? interactivePreviewMarkup(scene, viewport, libraries)
         : coverPreviewMarkup(scene, stage, viewport);
-  return htmlDocument(markup, scene);
+  // Slides typeset formulas as KaTeX HTML, which needs KaTeX's CSS and fonts.
+  // The srcdoc inherits this base, so root-relative and module URLs resolve
+  // without granting authored <base> elements permission in the CSP.
+  return htmlDocument(
+    markup,
+    scene,
+    scene.type === 'slide' ? katexPreviewStylesheet() : '',
+    libraries && INTERACTIVE_PREVIEW_ORIGIN,
+  );
 }
 
 let slideClientBundle: Promise<string> | undefined;
@@ -249,7 +303,7 @@ export function buildSlideClientBundle(builder: SlideBundleBuilder = build): Pro
         import React from 'react';
         import { flushSync } from 'react-dom';
         import { createRoot } from 'react-dom/client';
-        import { SlideCanvas } from '@openmaic/renderer';
+        import { SlideCanvas, completeInlineMath } from '@openmaic/renderer';
 
         const props = window.__OPENMAIC_PREVIEW_PROPS__;
         const root = document.getElementById('preview-slide-root');
@@ -280,6 +334,9 @@ export function buildSlideClientBundle(builder: SlideBundleBuilder = build): Pro
           style: { width: renderedWidth + 'px', height: renderedHeight + 'px' },
         }, canvasNode));
         flushSync(() => createRoot(root).render(frame));
+        // The live renderer typesets inline formulas within a per-pass budget
+        // and leaves the rest to idle time; a capture needs all of them now.
+        completeInlineMath(root);
         window.__OPENMAIC_PREVIEW_MOUNTED__ = true;
       `,
     },
@@ -345,19 +402,109 @@ export async function waitForDocumentAssets(document: AssetDocument): Promise<vo
   })()`);
 }
 
-/** Wait for a srcDoc iframe and the assets inside its browsing context. */
-export async function waitForInteractiveFrame(page: Page): Promise<void> {
+/** Wait for the embedded document to finish loading. */
+async function loadedInteractiveFrame(page: Page): Promise<Frame> {
   const iframe = await page.waitForSelector('iframe');
   const frame = await iframe?.contentFrame();
   if (!frame) throw new Error('Interactive preview iframe did not load');
   await frame.waitForFunction(
     () => location.href === 'about:srcdoc' && document.readyState === 'complete',
   );
-  await waitForDocumentAssets(frame);
+  return frame;
+}
+
+/** Wait for a srcDoc iframe and the assets inside its browsing context. */
+export async function waitForInteractiveFrame(page: Page): Promise<void> {
+  await waitForDocumentAssets(await loadedInteractiveFrame(page));
 }
 
 function abortError(signal: AbortSignal): Error {
   return signal.reason instanceof Error ? signal.reason : new Error('Preview aborted');
+}
+
+/**
+ * Schemes a request from inside the untrusted frame may still use. They carry
+ * data with the document rather than reaching the network, so the injected CSP
+ * already allows them and interception stays a defense-in-depth layer.
+ */
+const SUBFRAME_ALLOWED_PROTOCOLS = new Set(['data:', 'blob:', 'about:']);
+
+/** The `setContent` document loads as `about:blank`; nothing else may replace it. */
+const MAIN_FRAME_NAVIGATION_PROTOCOLS = new Set(['about:']);
+
+function requestProtocol(url: string): string {
+  try {
+    return new URL(url).protocol;
+  } catch {
+    return '';
+  }
+}
+
+/** Resolve one intercepted request exactly once, never letting a page hang. */
+function settleRequest(request: HTTPRequest, allow: boolean): void {
+  try {
+    if (request.isInterceptResolutionHandled()) return;
+    const action = allow ? request.continue() : request.abort('blockedbyclient');
+    void action.catch(() => {});
+  } catch {
+    // The request can already be gone (detached frame, aborted navigation).
+  }
+}
+
+/**
+ * Puppeteer-level counterpart to the injected CSP. The main frame keeps loading
+ * its own preview resources (slide images and the client bundle are
+ * deliberately untouched), while every request from the untrusted interactive
+ * frame and anything nested inside it is aborted unless it is a local scheme
+ * or can be answered from the runtime check's hosted library directory.
+ * Main-frame navigation away from the `setContent` document is blocked too.
+ *
+ * Returns a disposer to detach the handler.
+ */
+export async function installPreviewRequestGuard(
+  page: Page,
+  libraries?: HostedInteractiveLibraries,
+  signal?: AbortSignal,
+): Promise<() => void> {
+  const mainFrame = page.mainFrame();
+  const handler = async (request: HTTPRequest): Promise<void> => {
+    let allow = false;
+    try {
+      const frame = request.frame();
+      const url = request.url();
+      if (frame === mainFrame) {
+        allow =
+          !request.isNavigationRequest() ||
+          MAIN_FRAME_NAVIGATION_PROTOCOLS.has(requestProtocol(url));
+      } else {
+        allow = SUBFRAME_ALLOWED_PROTOCOLS.has(requestProtocol(url));
+        if (
+          !allow &&
+          libraries &&
+          frame &&
+          !request.isNavigationRequest() &&
+          request.method() === 'GET'
+        ) {
+          const asset = await libraries.read(url, signal);
+          if (asset && !signal?.aborted && !request.isInterceptResolutionHandled()) {
+            await request.respond({
+              status: 200,
+              headers: { 'access-control-allow-origin': '*' },
+              ...asset,
+            });
+            return;
+          }
+        }
+      }
+    } catch {
+      allow = false;
+    }
+    settleRequest(request, allow);
+  };
+
+  await page.setRequestInterception(true);
+  page.on('request', handler);
+  return () => page.off('request', handler);
 }
 
 async function raceWithAbort<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
@@ -405,7 +552,9 @@ async function launchWithAbort(launch: Promise<Browser>, signal: AbortSignal): P
     return await raceWithAbort(launch, signal);
   } catch (error) {
     if (signal.aborted) {
-      void launch
+      // Keep the caller's execution permit until the launch settles and any
+      // browser it returns is closed; abort must not start background Chromiums.
+      await launch
         .then(async (browser) => {
           forceKillBrowser(browser);
           await closeBrowserBounded(browser);
@@ -440,16 +589,82 @@ export async function mountSlideClient(page: Page, bundle: string): Promise<void
 
 export interface ChromiumPreviewRendererOptions {
   browserLauncher?: Pick<typeof puppeteer, 'launch'>;
+  interactiveLibraries?: HostedInteractiveLibraries;
 }
 
 export class ChromiumPreviewRenderer implements PreviewRenderer {
   private readonly browserLauncher: Pick<typeof puppeteer, 'launch'>;
+  private readonly interactiveLibraries: HostedInteractiveLibraries;
 
   constructor(options: ChromiumPreviewRendererOptions = {}) {
     this.browserLauncher = options.browserLauncher ?? puppeteer;
+    this.interactiveLibraries = options.interactiveLibraries ?? hostedInteractiveLibraries;
   }
 
   async render(request: PreviewRequest): Promise<Uint8Array> {
+    return this.withPreviewPage(request, async (page) => {
+      await page.setContent(buildPreviewHtml(request.scene, request.stage, request.viewport), {
+        waitUntil: 'domcontentloaded',
+      });
+
+      if (request.scene.type === 'slide') {
+        await page.evaluate(
+          (slide, viewport) => {
+            Object.assign(window, {
+              __OPENMAIC_PREVIEW_PROPS__: { slide, viewport },
+            });
+          },
+          request.scene.content.canvas,
+          request.viewport,
+        );
+        await mountSlideClient(page, await buildSlideClientBundle());
+      }
+
+      const selected = await page.evaluate(
+        (sceneId) => document.body.getAttribute('data-scene-id') === sceneId,
+        request.scene.id,
+      );
+      if (!selected) {
+        throw new Error(`Requested scene was not found in the preview page (${request.scene.id})`);
+      }
+
+      if (request.scene.type === 'interactive') await waitForInteractiveFrame(page);
+      else await waitForDocumentAssets(page);
+
+      const png = await page.screenshot({ type: 'png', optimizeForSpeed: true });
+      return new Uint8Array(png);
+    });
+  }
+
+  async checkInteractiveRuntime(
+    request: InteractiveRuntimeRequest,
+  ): Promise<InteractiveRuntimeError[]> {
+    const libraries = this.interactiveLibraries;
+    return this.withPreviewPage(
+      request,
+      async (page) => {
+        const collector = collectInteractiveRuntimeErrors(page, libraries);
+        try {
+          await page.setContent(
+            buildPreviewHtml(request.scene, request.stage, request.viewport, libraries),
+            { waitUntil: 'domcontentloaded' },
+          );
+          const frame = await loadedInteractiveFrame(page);
+          await replayInteractiveActions(page, frame, request.scene.actions ?? [], collector);
+          return collector.errors;
+        } finally {
+          collector.dispose();
+        }
+      },
+      libraries,
+    );
+  }
+
+  private async withPreviewPage<T>(
+    request: PreviewRequest,
+    run: (page: Page) => Promise<T>,
+    libraries?: HostedInteractiveLibraries,
+  ): Promise<T> {
     if (request.signal.aborted) throw abortError(request.signal);
 
     const executablePath =
@@ -462,6 +677,8 @@ export class ChromiumPreviewRenderer implements PreviewRenderer {
       this.browserLauncher.launch({
         executablePath,
         headless: true,
+        signal: request.signal,
+        timeout: request.deadlineMs,
         protocolTimeout: request.deadlineMs + PREVIEW_PROTOCOL_TIMEOUT_BUFFER_MS,
         args: ['--no-sandbox', '--disable-dev-shm-usage'],
       }),
@@ -475,38 +692,16 @@ export class ChromiumPreviewRenderer implements PreviewRenderer {
         (async () => {
           const page = await browser.newPage();
           await page.setViewport(request.viewport);
-          await page.setContent(buildPreviewHtml(request.scene, request.stage, request.viewport), {
-            waitUntil: 'domcontentloaded',
-          });
-
-          if (request.scene.type === 'slide') {
-            await page.evaluate(
-              (slide, viewport) => {
-                Object.assign(window, {
-                  __OPENMAIC_PREVIEW_PROPS__: { slide, viewport },
-                });
-              },
-              request.scene.content.canvas,
-              request.viewport,
-            );
-            await mountSlideClient(page, await buildSlideClientBundle());
-          }
-
-          const selected = await page.evaluate(
-            (sceneId) => document.body.getAttribute('data-scene-id') === sceneId,
-            request.scene.id,
+          const removeRequestGuard = await installPreviewRequestGuard(
+            page,
+            libraries,
+            request.signal,
           );
-          if (!selected) {
-            throw new Error(
-              `Requested scene was not found in the preview page (${request.scene.id})`,
-            );
+          try {
+            return await run(page);
+          } finally {
+            removeRequestGuard();
           }
-
-          if (request.scene.type === 'interactive') await waitForInteractiveFrame(page);
-          else await waitForDocumentAssets(page);
-
-          const png = await page.screenshot({ type: 'png', optimizeForSpeed: true });
-          return new Uint8Array(png);
         })(),
         request.signal,
       );

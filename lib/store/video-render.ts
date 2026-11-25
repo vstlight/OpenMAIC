@@ -50,7 +50,14 @@ const ETA_MIN_PERCENT = 3;
  */
 const SPEED_SMOOTHING = 0.3;
 
-export type VideoRenderStatus = 'idle' | 'compiling' | 'rendering' | 'succeeded' | 'failed';
+export type VideoRenderStatus =
+  | 'idle'
+  | 'compiling'
+  | 'uploading'
+  | 'queued'
+  | 'rendering'
+  | 'succeeded'
+  | 'failed';
 
 /** Minimal i18n surface the store needs, injected by callers. */
 type Translate = (key: string, options?: Record<string, unknown>) => string;
@@ -78,6 +85,7 @@ interface JobStatusResponse {
   status: 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled';
   progress?: number;
   currentStage?: string;
+  queuePosition?: number;
   error?: string;
   done?: boolean;
 }
@@ -88,6 +96,8 @@ interface VideoRenderState {
   percent: number;
   /** Estimated milliseconds remaining, or null while unknown. */
   etaMs: number | null;
+  /** Position in the render queue (0 = next), or null when not queued. */
+  queuePosition: number | null;
   filename: string | null;
   error: string | null;
   /**
@@ -106,7 +116,12 @@ interface VideoRenderState {
 
 /** Whether a status means a render is still in flight. */
 function inFlight(status: VideoRenderStatus): boolean {
-  return status === 'compiling' || status === 'rendering';
+  return (
+    status === 'compiling' ||
+    status === 'uploading' ||
+    status === 'queued' ||
+    status === 'rendering'
+  );
 }
 
 // One in-memory retry slot; the active request and the slot share the same Blob.
@@ -134,10 +149,19 @@ function invalidateCachedZip() {
   releaseIdleObservers();
 }
 
+function rejectionMessageKey(status: number | null, reason?: string): string | undefined {
+  if (status === 413) return 'export.videoTooLarge';
+  if (status !== 429) return undefined;
+  if (reason === 'queue_full') return 'export.videoQueueFull';
+  if (reason === 'per_identity_limit') return 'export.videoRenderInProgress';
+  return undefined;
+}
+
 export const useVideoRenderStore = create<VideoRenderState>()((set, get) => ({
   status: 'idle',
   percent: 0,
   etaMs: null,
+  queuePosition: null,
   filename: null,
   error: null,
   options: DEFAULT_OPTIONS,
@@ -157,7 +181,14 @@ export const useVideoRenderStore = create<VideoRenderState>()((set, get) => ({
 
   reset: () => {
     invalidateCachedZip();
-    set({ status: 'idle', percent: 0, etaMs: null, filename: null, error: null });
+    set({
+      status: 'idle',
+      percent: 0,
+      etaMs: null,
+      queuePosition: null,
+      filename: null,
+      error: null,
+    });
   },
 
   startRender: async (t, locale) => {
@@ -224,20 +255,24 @@ export const useVideoRenderStore = create<VideoRenderState>()((set, get) => ({
       }
       ({ zipBlob, stageName, missingCount, errorCount } = built);
     } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      set({ status: 'failed', error: message });
       if (error instanceof NoScenesError) {
         toast.error(t('export.videoNoScenes'), { id: toastId });
       } else {
         log.error('Video render (compile) failed:', error);
         toast.error(t('export.videoFailed'), { id: toastId });
       }
-      set({ status: 'failed', error: 'compile' });
       activeRenders -= 1;
       releaseIdleObservers();
       return;
     }
 
     const filename = `${sanitizeFilename(stageName)}.mp4`;
-    set({ status: 'rendering', filename });
+    // The upload to the render service starts now. Distinguishing uploading from
+    // rendering lets the UI show "Uploading..." instead of a flat 0% while the
+    // ZIP is in transit and the server hasn't started the render yet.
+    set({ status: 'uploading', filename, queuePosition: null });
 
     // ETA via recent speed: track the previous (percent, timestamp) sample,
     // derive an instantaneous percent-per-ms rate, EMA-smooth it, and project
@@ -254,6 +289,7 @@ export const useVideoRenderStore = create<VideoRenderState>()((set, get) => ({
     // unavailable" (degrade to ZIP) from a real rejection like 429/413/5xx
     // (surface the error instead of an unsolicited download). null = fetch threw.
     let submitStatus: number | null = null;
+    let submitReason: string | undefined;
 
     try {
       const form = new FormData();
@@ -262,7 +298,7 @@ export const useVideoRenderStore = create<VideoRenderState>()((set, get) => ({
       form.append('quality', quality);
       form.append('format', 'mp4');
 
-      toast.loading(t('export.videoRendering'), { id: toastId });
+      toast.loading(t('export.videoUploading'), { id: toastId });
 
       const mp4 = await runPolledTask<Blob>({
         label: 'render-video',
@@ -274,9 +310,11 @@ export const useVideoRenderStore = create<VideoRenderState>()((set, get) => ({
             jobId?: string;
             error?: string;
             details?: string;
+            reason?: string;
           };
           if (!res.ok || !data.jobId) {
             submitStatus = res.status;
+            submitReason = data.reason;
             const detail = [data.error, data.details].filter(Boolean).join(': ');
             return { status: 'failed', message: detail || `HTTP ${res.status}` };
           }
@@ -310,7 +348,26 @@ export const useVideoRenderStore = create<VideoRenderState>()((set, get) => ({
             lastPercent = percent;
             lastTs = now;
           }
-          set({ percent, etaMs });
+
+          const jobQueuePosition =
+            typeof data.queuePosition === 'number' ? data.queuePosition : null;
+          if (data.status === 'queued') {
+            set({ status: 'queued', queuePosition: jobQueuePosition, percent: 0, etaMs: null });
+            toast.loading(
+              jobQueuePosition != null
+                ? t('export.videoQueuePosition', { position: jobQueuePosition + 1 })
+                : t('export.videoQueued'),
+              { id: toastId },
+            );
+          } else if (data.status === 'running') {
+            if (get().status === 'queued' || get().status === 'uploading') {
+              set({ status: 'rendering', queuePosition: null });
+              toast.loading(t('export.videoRendering'), { id: toastId });
+            }
+            set({ percent, etaMs });
+          } else {
+            set({ percent, etaMs });
+          }
 
           if (data.status === 'succeeded') {
             const dl = await fetch(`/api/export-video/render/${jobId}/download`);
@@ -347,8 +404,9 @@ export const useVideoRenderStore = create<VideoRenderState>()((set, get) => ({
           toast.info(t('export.videoServiceUnavailable'), { id: toastId });
         } else {
           if (submitStatus === 400 || submitStatus === 413) invalidateCachedZip();
-          set({ status: 'failed', error: message });
-          toast.error(t('export.videoFailed'), { id: toastId });
+          set({ status: 'failed', error: message, queuePosition: null });
+          const key = rejectionMessageKey(submitStatus, submitReason);
+          toast.error(t(key ?? 'export.videoFailed'), { id: toastId });
         }
       } else {
         // The render started but failed / timed out. Cancel the server job so it
@@ -357,7 +415,7 @@ export const useVideoRenderStore = create<VideoRenderState>()((set, get) => ({
           () => {},
         );
         log.error('Video render failed:', error);
-        set({ status: 'failed', error: message });
+        set({ status: 'failed', error: message, queuePosition: null });
         toast.error(t('export.videoFailed'), { id: toastId });
       }
     } finally {

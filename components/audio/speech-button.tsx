@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useRef } from 'react';
-import { Mic, Loader2 } from 'lucide-react';
+import { Mic, MicOff, Loader2 } from 'lucide-react';
 import { useAudioRecorder } from '@/lib/hooks/use-audio-recorder';
 import { useASRAvailable } from '@/lib/hooks/use-asr-available';
 import { useI18n } from '@/lib/hooks/use-i18n';
@@ -11,11 +11,14 @@ import { toast } from 'sonner';
 
 interface SpeechButtonProps {
   onTranscription: (text: string) => void;
+  onActiveChange?: (active: boolean) => void;
   className?: string;
   disabled?: boolean;
   size?: 'sm' | 'md';
   /** Keep browser-native ASR active until the user manually stops it. */
   continuous?: boolean;
+  /** Hide the idle control without unmounting an active recorder. */
+  hiddenWhenIdle?: boolean;
 }
 
 export function shouldCancelRecordingOnDisable(args: {
@@ -28,10 +31,12 @@ export function shouldCancelRecordingOnDisable(args: {
 
 export function SpeechButton({
   onTranscription,
+  onActiveChange,
   className,
   disabled,
   size = 'sm',
   continuous,
+  hiddenWhenIdle = false,
 }: SpeechButtonProps) {
   const { t } = useI18n();
 
@@ -49,7 +54,7 @@ export function SpeechButton({
     toast.error(error);
   }, []);
 
-  const { isRecording, isProcessing, startRecording, stopRecording, cancelRecording } =
+  const { isStarting, isRecording, isProcessing, startRecording, stopRecording, cancelRecording } =
     useAudioRecorder({
       onTranscription: stableOnTranscription,
       onError: handleError,
@@ -62,7 +67,12 @@ export function SpeechButton({
     }
   }, [continuous, disabled, isRecording, cancelRecording]);
 
-  const active = isRecording || isProcessing;
+  const active = isStarting || isRecording || isProcessing;
+  useEffect(() => {
+    if (!active) return;
+    onActiveChange?.(true);
+    return () => onActiveChange?.(false);
+  }, [active, onActiveChange]);
 
   // Gate on ASR availability (toggle + provider configured + browser support)
   // so every call site is disabled uniformly when ASR is off/unusable — but
@@ -72,7 +82,9 @@ export function SpeechButton({
   const isDisabled = (disabled || !asrAvailable) && !active;
 
   const handleClick = () => {
-    if (isRecording) {
+    if (isStarting) {
+      cancelRecording();
+    } else if (isRecording) {
       stopRecording();
     } else if (!isProcessing) {
       startRecording();
@@ -84,11 +96,24 @@ export function SpeechButton({
   const iconSize = isMd ? 'w-4 h-4' : 'w-3.5 h-3.5';
   const barH = isMd ? 14 : 10;
 
+  if (hiddenWhenIdle && !active) return null;
+
+  // Same wording as the classroom's mic, so every surface explains the same state.
+  const label = isProcessing
+    ? t('roundtable.processing')
+    : isRecording || isStarting
+      ? t('voice.stopListening')
+      : asrAvailable
+        ? t('roundtable.voiceInput')
+        : t('roundtable.voiceInputDisabled');
+
   return (
     <Tooltip>
       <TooltipTrigger asChild>
         <button
           type="button"
+          data-state={active ? 'active' : 'idle'}
+          aria-label={label}
           disabled={isDisabled || isProcessing}
           onClick={handleClick}
           className={cn(
@@ -111,7 +136,7 @@ export function SpeechButton({
             />
           )}
 
-          {isProcessing ? (
+          {isProcessing || isStarting ? (
             <Loader2 className={cn(iconSize, 'animate-spin')} />
           ) : isRecording ? (
             /* Mini equalizer bars */
@@ -128,8 +153,10 @@ export function SpeechButton({
                 />
               ))}
             </span>
-          ) : (
+          ) : asrAvailable ? (
             <Mic className={cn(iconSize, 'relative z-10')} />
+          ) : (
+            <MicOff className={cn(iconSize, 'relative z-10')} />
           )}
 
           {/* Injected keyframes */}
@@ -157,11 +184,7 @@ export function SpeechButton({
         </button>
       </TooltipTrigger>
       <TooltipContent side="top" className="text-xs">
-        {isProcessing
-          ? t('roundtable.processing')
-          : isRecording
-            ? t('voice.stopListening')
-            : t('voice.startListening')}
+        {label}
       </TooltipContent>
     </Tooltip>
   );

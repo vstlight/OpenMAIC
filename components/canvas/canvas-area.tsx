@@ -1,8 +1,16 @@
 'use client';
 
-import { useCallback, type ReactNode } from 'react';
+import {
+  useCallback,
+  useImperativeHandle,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type Ref,
+  type ReactNode,
+} from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { Play } from 'lucide-react';
+import { ArrowLeft, ClosedCaption, Ellipsis, Play, Pause } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { SceneRenderer } from '@/components/stage/scene-renderer';
 import { SceneProvider } from '@/lib/contexts/scene-context';
@@ -11,26 +19,39 @@ import { CanvasToolbar } from '@/components/canvas/canvas-toolbar';
 import type { CanvasToolbarProps } from '@/components/canvas/canvas-toolbar';
 import type { Scene, StageMode } from '@/lib/types/stage';
 import { useI18n } from '@/lib/hooks/use-i18n';
-import { ClassroomCompletePageConnected } from '@/components/scene-renderers/classroom-complete';
 import { ContainBox } from '@/components/edit/ContainBox';
 import { useInWorkbenchPanel } from '@/lib/workbench/panel-context';
 import type { PPTElement } from '@openmaic/dsl';
+import type { WhiteboardElementReference } from '@/lib/types/chat';
 import { SlideElementPickOverlay } from '@/components/canvas/slide-element-pick-overlay';
 
 interface CanvasAreaProps extends CanvasToolbarProps {
+  readonly revealControlsRef?: Ref<() => void>;
+  readonly mobileCourseName?: string;
+  readonly onMobileBack?: () => void;
+  readonly mobileSpeech?: string | null;
   readonly currentScene: Scene | null;
   readonly mode: StageMode;
   readonly hideToolbar?: boolean;
   readonly isPendingScene?: boolean;
-  readonly isCourseComplete?: boolean;
   readonly isGenerationFailed?: boolean;
+  readonly generationFailureMessage?: string;
+  /** The pending scene will never be produced (its generation was interrupted). */
+  readonly isGenerationInterrupted?: boolean;
   readonly onRetryGeneration?: () => void;
   readonly elementPickActive?: boolean;
+  readonly whiteboardElementReference?: WhiteboardElementReference;
+  readonly onPickWhiteboardElement?: (element: PPTElement) => void;
   readonly onPickElement?: (element: PPTElement) => void;
   readonly onCancelElementPick?: () => void;
 }
 
 export function CanvasArea({
+  mobile = false,
+  revealControlsRef,
+  mobileCourseName,
+  onMobileBack,
+  mobileSpeech,
   currentScene,
   currentSceneIndex,
   scenesCount,
@@ -55,15 +76,57 @@ export function CanvasArea({
   onContinueDiscussion,
   hideToolbar,
   isPendingScene,
-  isCourseComplete,
   isGenerationFailed,
+  generationFailureMessage,
+  isGenerationInterrupted,
   onRetryGeneration,
   elementPickActive,
+  whiteboardElementReference,
   onPickElement,
+  onPickWhiteboardElement,
   onCancelElementPick,
 }: CanvasAreaProps) {
   const { t } = useI18n();
   const inWorkbenchPanel = useInWorkbenchPanel();
+  const [mobileControls, setMobileControls] = useState(true);
+  const [captions, setCaptions] = useState(false);
+  const mobileHideTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const revealMobileControls = useCallback((autoHide: boolean) => {
+    clearTimeout(mobileHideTimer.current);
+    setMobileControls(true);
+    if (autoHide) mobileHideTimer.current = setTimeout(() => setMobileControls(false), 2000);
+  }, []);
+  useLayoutEffect(() => {
+    if (!mobile) return;
+    clearTimeout(mobileHideTimer.current);
+    if (engineState === 'playing' || currentScene?.type === 'quiz' || whiteboardOpen) {
+      // Keep the playing canvas, quiz and open whiteboard clear of the player overlay.
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- switch presentation chrome with the scene
+      setMobileControls(false);
+    } else {
+      revealMobileControls(true);
+    }
+    return () => clearTimeout(mobileHideTimer.current);
+  }, [
+    mobile,
+    engineState,
+    currentScene?.id,
+    currentScene?.type,
+    whiteboardOpen,
+    revealMobileControls,
+  ]);
+  const toggleMobileControls = useCallback(() => {
+    clearTimeout(mobileHideTimer.current);
+    setMobileControls((visible) => !visible);
+  }, []);
+  useImperativeHandle(
+    revealControlsRef,
+    () => () => {
+      if (!mobile || whiteboardOpen || currentScene?.type === 'quiz') return;
+      revealMobileControls(currentScene?.type === 'interactive');
+    },
+    [mobile, whiteboardOpen, currentScene?.type, revealMobileControls],
+  );
   const showControls = mode === 'playback' && !whiteboardOpen;
   const showPlayHint =
     showControls &&
@@ -74,7 +137,7 @@ export function CanvasArea({
 
   const handleSlideClick = useCallback(
     (e: React.MouseEvent) => {
-      if (!showControls || isLiveSession || currentScene?.type !== 'slide') return;
+      if (!showControls || (!mobile && isLiveSession) || currentScene?.type !== 'slide') return;
       // Don't trigger page play/pause when clicking inside a video element's visual area.
       // Video elements may be visually covered by other slide elements (e.g. text),
       // so we check click coordinates against all video element bounding rects.
@@ -91,13 +154,49 @@ export function CanvasArea({
           return;
         }
       }
-      onPlayPause();
+      if (mobile) toggleMobileControls();
+      else onPlayPause();
     },
-    [showControls, isLiveSession, onPlayPause, currentScene?.type],
+    [showControls, isLiveSession, onPlayPause, currentScene?.type, mobile, toggleMobileControls],
+  );
+
+  const whiteboardLayer = (
+    <div className={cn('absolute inset-0 pointer-events-none', mobile ? 'z-[120]' : 'z-[110]')}>
+      <SceneProvider>
+        <Whiteboard
+          isOpen={whiteboardOpen}
+          onClose={onWhiteboardClose}
+          mobile={mobile}
+          elementPickActive={elementPickActive && whiteboardOpen}
+          whiteboardElementReference={whiteboardElementReference}
+          onPickElement={onPickWhiteboardElement}
+          onCancelElementPick={onCancelElementPick}
+        />
+      </SceneProvider>
+    </div>
   );
 
   return (
-    <div className="w-full h-full flex flex-col bg-gray-50 dark:bg-gray-900 group/canvas">
+    <div
+      data-mobile-canvas={mobile || undefined}
+      className="w-full h-full flex flex-col bg-gray-50 dark:bg-gray-900 group/canvas"
+    >
+      {mobile && currentScene?.type === 'quiz' && !whiteboardOpen && (
+        <div
+          data-testid="mobile-quiz-navigation"
+          className="flex h-11 shrink-0 items-center gap-1 bg-background px-1 text-foreground"
+        >
+          <button
+            type="button"
+            className="grid size-11 shrink-0 place-items-center rounded-lg active:bg-muted"
+            onClick={onMobileBack}
+            aria-label={t('common.back')}
+          >
+            <ArrowLeft size={20} aria-hidden="true" />
+          </button>
+          <span className="min-w-0 truncate pe-3 text-[13px] font-medium">{mobileCourseName}</span>
+        </div>
+      )}
       {/* Slide area — takes remaining space */}
       <div
         className={cn(
@@ -109,9 +208,16 @@ export function CanvasArea({
       >
         <StageViewport
           workbench={inWorkbenchPanel}
-          interactive={currentScene?.type === 'interactive'}
+          fillContainer={
+            (mobile && currentScene?.type === 'quiz') ||
+            currentScene?.type === 'interactive' ||
+            (currentScene?.content.type === 'pbl' && !!currentScene.content.projectV3)
+          }
           className={cn(
-            'bg-white dark:bg-gray-800 shadow-2xl rounded-lg overflow-hidden relative transition-all duration-700',
+            // Only its colours ease, between scene types. Its size must not: a box
+            // measured on mount would otherwise visibly shrink to 16:9 every time.
+            'bg-white dark:bg-gray-800 shadow-2xl rounded-lg overflow-hidden relative transition-[background-color,box-shadow] duration-700',
+            mobile && 'rounded-none shadow-none',
             showControls && !isLiveSession && currentScene?.type === 'slide' && 'cursor-pointer',
             currentScene?.type === 'interactive'
               ? 'shadow-blue-200/50 dark:shadow-blue-900/50 ring-1 ring-blue-900/5 dark:ring-blue-500/10'
@@ -119,12 +225,7 @@ export function CanvasArea({
           )}
           onClick={handleSlideClick}
         >
-          {/* Whiteboard Layer */}
-          <div className="absolute inset-0 z-[110] pointer-events-none">
-            <SceneProvider>
-              <Whiteboard isOpen={whiteboardOpen} onClose={onWhiteboardClose} />
-            </SceneProvider>
-          </div>
+          {!mobile && whiteboardLayer}
 
           {/* Scene Content */}
           {currentScene && !whiteboardOpen && (
@@ -136,6 +237,7 @@ export function CanvasArea({
           )}
 
           {elementPickActive &&
+            !whiteboardOpen &&
             onPickElement &&
             onCancelElementPick &&
             currentScene?.type === 'slide' &&
@@ -147,21 +249,9 @@ export function CanvasArea({
               />
             )}
 
-          {/* Pending Scene Loading / Completion Overlay */}
+          {/* Pending Scene Loading Overlay */}
           <AnimatePresence>
-            {isPendingScene && !currentScene && isCourseComplete && (
-              <motion.div
-                key="course-complete"
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                exit={{ opacity: 0 }}
-                transition={{ duration: 0.3, ease: 'easeOut' }}
-                className="absolute inset-0"
-              >
-                <ClassroomCompletePageConnected />
-              </motion.div>
-            )}
-            {isPendingScene && !currentScene && !isCourseComplete && (
+            {isPendingScene && !currentScene && (
               <motion.div
                 initial={{ opacity: 0 }}
                 animate={{ opacity: 1 }}
@@ -169,7 +259,7 @@ export function CanvasArea({
                 transition={{ duration: 0.4, ease: 'easeOut' }}
                 className="absolute inset-0 z-[105] flex flex-col items-center justify-center bg-white dark:bg-gray-800"
               >
-                {isGenerationFailed ? (
+                {isGenerationFailed || isGenerationInterrupted ? (
                   <div className="flex flex-col items-center gap-3">
                     <div className="w-12 h-12 rounded-full bg-red-50 dark:bg-red-900/20 flex items-center justify-center">
                       <svg
@@ -186,10 +276,12 @@ export function CanvasArea({
                         />
                       </svg>
                     </div>
-                    <span className="text-sm text-red-500 dark:text-red-400 font-medium">
-                      {t('stage.generationFailed')}
+                    <span className="max-w-md px-4 text-center text-sm text-red-500 dark:text-red-400 font-medium">
+                      {isGenerationInterrupted
+                        ? t('stage.generationInterrupted')
+                        : (generationFailureMessage ?? t('stage.generationFailed'))}
                     </span>
-                    {onRetryGeneration && (
+                    {onRetryGeneration && !isGenerationInterrupted && (
                       <button
                         onClick={onRetryGeneration}
                         className="mt-1 px-4 py-1.5 text-xs font-medium rounded-full bg-red-50 dark:bg-red-900/20 text-red-600 dark:text-red-400 hover:bg-red-100 dark:hover:bg-red-900/40 transition-colors active:scale-95"
@@ -222,14 +314,17 @@ export function CanvasArea({
 
           {/* Scene Number Badge */}
           {currentScene && (
-            <div className="absolute top-4 right-4 text-gray-200 dark:text-gray-700 font-black text-4xl opacity-50 pointer-events-none select-none mix-blend-multiply dark:mix-blend-screen">
+            <div
+              data-canvas-page-number
+              className="absolute top-4 right-4 text-gray-200 dark:text-gray-700 font-black text-4xl opacity-50 pointer-events-none select-none mix-blend-multiply dark:mix-blend-screen"
+            >
               {(currentSceneIndex + 1).toString().padStart(2, '0')}
             </div>
           )}
 
           {/* Play hint — breathing button when idle or paused (slides only) */}
           <AnimatePresence>
-            {showPlayHint && (
+            {showPlayHint && !mobile && (
               <motion.div
                 initial={{ opacity: 0 }}
                 animate={{ opacity: 1 }}
@@ -268,6 +363,86 @@ export function CanvasArea({
             )}
           </AnimatePresence>
         </StageViewport>
+        {mobile && whiteboardLayer}
+        {mobile && (
+          <>
+            <div
+              className="mobile-canvas-chrome"
+              data-visible={mobileControls}
+              inert={!mobileControls}
+            >
+              <div className="mobile-canvas-header">
+                <button type="button" onClick={onMobileBack} aria-label={t('common.back')}>
+                  <ArrowLeft size={20} />
+                </button>
+                <span>{mobileCourseName}</span>
+              </div>
+              <div className="mobile-canvas-footer">
+                <button
+                  type="button"
+                  aria-label={t('mobileClassroom.captions')}
+                  aria-pressed={captions}
+                  onClick={() => setCaptions((value) => !value)}
+                >
+                  <ClosedCaption size={22} />
+                </button>
+                <button
+                  type="button"
+                  aria-label={t(isPresenting ? 'stage.exitFullscreen' : 'stage.fullscreen')}
+                  aria-pressed={isPresenting}
+                  onClick={onTogglePresentation}
+                >
+                  <svg
+                    width="22"
+                    height="22"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="1.8"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    aria-hidden="true"
+                  >
+                    <rect x="3" y="2" width="12" height="20" rx="2.5" />
+                    <path d="M19 8h1a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2h-1" />
+                  </svg>
+                </button>
+              </div>
+              {showControls && currentScene?.type === 'slide' && !isLiveSession && (
+                <button
+                  type="button"
+                  className="mobile-canvas-play"
+                  aria-label={t(
+                    engineState === 'playing' ? 'mobileClassroom.pause' : 'mobileClassroom.play',
+                  )}
+                  onClick={() => {
+                    if (engineState !== 'playing') {
+                      clearTimeout(mobileHideTimer.current);
+                      setMobileControls(false);
+                    }
+                    onPlayPause();
+                  }}
+                >
+                  {engineState === 'playing' ? <Pause size={24} /> : <Play size={24} />}
+                </button>
+              )}
+            </div>
+            {currentScene?.type === 'interactive' && !mobileControls && !whiteboardOpen && (
+              <button
+                type="button"
+                className="mobile-canvas-menu absolute top-0 right-0 z-[116] grid size-11 place-items-center text-violet-600"
+                onClick={() => revealMobileControls(true)}
+                aria-label={t('mobileClassroom.controls')}
+                aria-expanded={false}
+              >
+                <Ellipsis size={20} />
+              </button>
+            )}
+            {captions && mobileSpeech && !whiteboardOpen && currentScene?.type !== 'quiz' && (
+              <div className="mobile-canvas-caption">{mobileSpeech}</div>
+            )}
+          </>
+        )}
       </div>
 
       {/* ── Canvas Toolbar — in document flow, only when not merged into roundtable ── */}
@@ -306,18 +481,18 @@ export function CanvasArea({
 
 function StageViewport({
   workbench,
-  interactive,
+  fillContainer,
   className,
   onClick,
   children,
 }: {
   readonly workbench: boolean;
-  readonly interactive: boolean;
+  readonly fillContainer: boolean;
   readonly className?: string;
   readonly onClick?: (event: React.MouseEvent) => void;
   readonly children: ReactNode;
 }) {
-  if (interactive) {
+  if (fillContainer) {
     return (
       <div className={cn('h-full w-full', className)} onClick={onClick}>
         {children}

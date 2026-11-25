@@ -7,7 +7,7 @@ Generate a self-contained HTML 3D visualization with embedded widget configurati
 Your output must be a complete HTML document with:
 
 1. **Standard HTML5 structure**
-2. **Three.js loaded from CDN** (use unpkg or cdnjs)
+2. **Three.js loaded from the deployment** (use the available library URLs below)
 3. **Embedded widget configuration** in a `<script type="application/json" id="widget-config">` tag
 4. **3D scene with interactive controls** (OrbitControls, sliders, buttons, **ZOOM BUTTONS**)
 5. **Mobile-responsive design**
@@ -187,7 +187,8 @@ const earth = new THREE.Mesh(earthGeometry, earthMaterial);
       background: #0a0a1a;  /* MUST match scene.background color! */
     }
     #canvas-container { width: 100%; height: 100%; position: relative; }
-    canvas { display: block; }
+    /* The renderer's canvas sits out of flow, so it never sizes its container. */
+    #canvas-container > canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
 
     /* Loading overlay - shows while Three.js initializes */
     #loading {
@@ -355,8 +356,8 @@ const earth = new THREE.Mesh(earthGeometry, earthMaterial);
   <script type="importmap">
   {
     "imports": {
-      "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
-      "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+      "three": "{{threeModuleUrl}}",
+      "three/addons/": "{{threeAddonsUrl}}"
     }
   }
   </script>
@@ -404,8 +405,8 @@ const earth = new THREE.Mesh(earthGeometry, earthMaterial);
 
         // Renderer
         const renderer = new THREE.WebGLRenderer({ antialias: true });
-        renderer.setSize(width, height);
         renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        renderer.setSize(width, height, false); // Drawing buffer only; the CSS above sizes the canvas
         container.appendChild(renderer.domElement);
 
         // OrbitControls
@@ -458,14 +459,15 @@ const earth = new THREE.Mesh(earthGeometry, earthMaterial);
           controls.target.set(0, 0, 0);
         });
 
-        // Handle resize
-        window.addEventListener('resize', () => {
-          const newWidth = container.clientWidth || window.innerWidth;
-          const newHeight = container.clientHeight || window.innerHeight;
+        // Resize with the container, which does not depend on the canvas
+        new ResizeObserver(() => {
+          const newWidth = container.clientWidth;
+          const newHeight = container.clientHeight;
+          if (!newWidth || !newHeight) return;
           camera.aspect = newWidth / newHeight;
           camera.updateProjectionMatrix();
-          renderer.setSize(newWidth, newHeight);
-        });
+          renderer.setSize(newWidth, newHeight, false);
+        }).observe(container);
 
         // Hide loading overlay - scene is ready
         document.getElementById('loading').style.display = 'none';
@@ -619,34 +621,37 @@ switch (action) {
 
 ### 2. Teacher Actions Listener Pattern
 
+Register the listener inside `initScene()`, in the same scope as `const camera` and `const objects`, after both have been initialized. Store each highlightable object's meshes in `objects` under its stable target selector. The optional scale example applies to a visualization that stores a scalable group as `objects.cellGroup`.
+
 Always wrap switch cases in braces:
 
 ```javascript
 window.addEventListener('message', (event) => {
-  const { action, payload } = event.data;
-  
-  switch (action) {
+  const { type, state, target, content } = event.data || {};
+
+  switch (type) {
     case 'SET_WIDGET_STATE': {
-      if (payload.cameraPosition) camera.position.set(...payload.cameraPosition);
-      if (payload.scale !== undefined) {
-        objects.cellGroup.scale.setScalar(payload.scale);
+      if (state?.cameraPosition) camera.position.set(...state.cameraPosition);
+      if (state?.scale !== undefined && objects.cellGroup) {
+        objects.cellGroup.scale.setScalar(state.scale);
       }
       break;
     }
-    
+
     case 'HIGHLIGHT_ELEMENT': {
-      const { elementId, highlight } = payload;
-      if (objects[elementId]) {
-        objects[elementId].forEach(mesh => {
-          mesh.material.emissive.set(highlight ? 0xffff00 : 0x000000);
-        });
-      }
+      objects[target]?.forEach(mesh => {
+        mesh.material.emissive.set(0xffff00);
+      });
       break;
     }
-    
+
     case 'ANNOTATE_ELEMENT': {
-      const { elementId, text } = payload;
-      // Create annotation tooltip
+      // Create a temporary annotation at target using content.
+      break;
+    }
+
+    case 'REVEAL_ELEMENT': {
+      // Show the object or control identified by target.
       break;
     }
   }
@@ -661,3 +666,12 @@ Return ONLY the HTML document, no markdown fences or explanations.
 - Do NOT duplicate content
 - Do NOT include multiple `<!DOCTYPE html>` tags
 - The output must end with exactly one `</html>` tag
+
+
+{{snippet:interactive-libraries}}
+
+{{snippet:interactive-math}}
+
+{{snippet:interactive-observation}}
+
+{{snippet:interactive-display-state}}

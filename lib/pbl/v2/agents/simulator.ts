@@ -40,6 +40,7 @@ import type {
   PBLAgentThread,
 } from '../types';
 import type { PBLSSEEvent } from '../api/sse';
+import { streamPBLParts } from '../api/llm-stream';
 import { recordEvent } from '../operations/kernel/engagement';
 import {
   currentMicrotask,
@@ -243,6 +244,27 @@ export function buildNarratorSystemPrompt(
 }
 
 /** Result of one director-narrator pass. */
+const NONE_SENTINEL_WRAPPERS = /^[`*_"'“”‘’«»]+|[`*_"'“”‘’«»]+$/g;
+const NONE_SENTINEL_TRAILING_PUNCTUATION = /[.。!！\s]+$/;
+
+/** The director-narrator asks for a literal `NONE` when nothing visible
+ *  happened, but models routinely wrap it in light Markdown or quotes
+ *  (`` `NONE` ``, `**NONE**`, `"NONE"`), sometimes with punctuation outside
+ *  the wrapper (`"NONE".`). Peel wrappers and trailing punctuation until
+ *  nothing changes, and accept the sentinel solely when nothing else remains,
+ *  so narration that merely mentions NONE keeps its bubble. */
+export function isNoneSentinel(text: string): boolean {
+  let stripped = text.trim();
+  for (let prev = ''; prev !== stripped; ) {
+    prev = stripped;
+    stripped = stripped
+      .replace(NONE_SENTINEL_WRAPPERS, '')
+      .replace(NONE_SENTINEL_TRAILING_PUNCTUATION, '')
+      .trim();
+  }
+  return /^none$/i.test(stripped);
+}
+
 /** Run the director-narrator pass: a short, non-streamed system-voice
  *  narration that sets / develops the scene. In the ACT model the director has
  *  NO progression role — a roleplay act is one continuous scene and only the
@@ -312,7 +334,7 @@ async function runDirectorNarratorPass(args: {
     const text = (result.text ?? '').trim();
     if (!text) return [];
     // Sentinel: model says nothing happened → no narration this turn.
-    if (/^none[.。!！\s]*$/i.test(text)) return [];
+    if (isNoneSentinel(text)) return [];
     // The narrator may emit several distinct beats (blank-line separated)
     // → render one neutral 'system' bubble each.
     return text
@@ -522,8 +544,8 @@ export async function* runSimulatorTurn(
         : [{ role: 'user' as const, content: userMessage.trim() || '…' }];
 
   // One streaming attempt of the character line. Yields token deltas as they
-  // arrive and returns the accumulated text (trimmed). Throws on stream error
-  // so the caller can decide retry vs surface.
+  // arrive and returns the accumulated text (trimmed). A rejected stream
+  // reaches the caller's error handler. Error parts can leave an empty attempt.
   async function* streamCharacterLine(): AsyncGenerator<PBLSSEEvent, string, void> {
     let acc = '';
     // The incoming per-request / stage-route config is what applies, handed to
@@ -542,17 +564,10 @@ export async function* runSimulatorTurn(
       'pbl-v2-simulator',
       thinkingConfig,
     );
-    for await (const part of stream.fullStream) {
-      if (part.type === 'text-delta') {
-        const delta =
-          (part as unknown as { text?: string; textDelta?: string }).text ??
-          (part as unknown as { textDelta?: string }).textDelta ??
-          '';
-        if (delta) {
-          acc += delta;
-          yield { type: 'token', delta };
-        }
-      }
+    for await (const part of streamPBLParts(stream.fullStream)) {
+      if (part.type !== 'token') continue;
+      acc += part.delta;
+      yield part;
     }
     return acc.trim();
   }
@@ -599,7 +614,8 @@ export async function* runSimulatorTurn(
     yield {
       type: 'error',
       code: 'EMPTY_LLM_OUTPUT',
-      message: '角色这一轮没有说话，请再试一次。',
+      // Locale-neutral on purpose: the client maps this code to an i18n string.
+      message: 'The character did not speak this turn. Please try again.',
     };
     yield { type: 'done' };
     return;

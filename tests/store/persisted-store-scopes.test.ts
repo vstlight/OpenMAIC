@@ -46,6 +46,23 @@ beforeEach(() => {
 });
 
 describe('settings store', () => {
+  it('hydrates an existing account value without creating a raw key', async () => {
+    await kv.set(
+      'settings-storage',
+      { state: { reviewOutlineEnabled: true, playbackSpeed: 1.5 }, version: 7 },
+      'account',
+    );
+    const { useSettingsStore } = await import('@/lib/store/settings');
+    await useSettingsStore.persist.rehydrate();
+
+    expect(useSettingsStore.getState()).toMatchObject({
+      reviewOutlineEnabled: true,
+      playbackSpeed: 1.5,
+    });
+    expect(await persistedIn('account', 'settings-storage')).toMatchObject({ playbackSpeed: 1.5 });
+    expect(localStorageStub.getItem('settings-storage')).toBeNull();
+  });
+
   it('persists under the account scope', async () => {
     const { useSettingsStore } = await import('@/lib/store/settings');
     await useSettingsStore.persist.rehydrate();
@@ -67,13 +84,13 @@ describe('settings store', () => {
   });
 
   it('ignores an existing raw blob and purges it, rather than migrating it', async () => {
-    localStorageStub.setItem('settings-storage', JSON.stringify({ state: { modelId: 'gpt-4o' } }));
+    localStorageStub.setItem('settings-storage', JSON.stringify({ state: { playbackSpeed: 2 } }));
 
     const { useSettingsStore } = await import('@/lib/store/settings');
     await useSettingsStore.persist.rehydrate();
 
     // The seeded value is not migrated — the store hydrates to its default.
-    expect(useSettingsStore.getState().modelId).toBe('');
+    expect(useSettingsStore.getState().playbackSpeed).toBe(1);
     // And the stale blob (which held plaintext API keys) is purged from
     // localStorage rather than left forever.
     expect(localStorageStub.getItem('settings-storage')).toBeNull();
@@ -97,8 +114,7 @@ describe('settings store — no pre-persist migration', () => {
     const { useSettingsStore } = await import('@/lib/store/settings');
     await useSettingsStore.persist.rehydrate();
 
-    expect(useSettingsStore.getState().modelId).toBe('');
-    expect(useSettingsStore.getState().providersConfig.openai?.apiKey).not.toBe(ANCIENT_KEY);
+    expect(JSON.stringify(useSettingsStore.getState())).not.toContain(ANCIENT_KEY);
     expect(await kv.get('settings-storage', 'account')).toBeNull();
   });
 

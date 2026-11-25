@@ -25,6 +25,9 @@ describe('render-service container contract', () => {
     expect(compose).toContain('PRODUCER_PUPPETEER_PROTOCOL_TIMEOUT_MS=900000');
     expect(compose).toContain('HF_STATIC_DEDUP=false');
     expect(compose).toContain('RENDER_PREVIEW_TIMEOUT_MS=${RENDER_PREVIEW_TIMEOUT_MS:-20000}');
+    expect(compose).toContain(
+      'RENDER_INTERACTIVE_RUNTIME_WAIT_MS=${RENDER_INTERACTIVE_RUNTIME_WAIT_MS:-2000}',
+    );
     expect(compose).toContain('RENDER_PREVIEW_MAX_IN_FLIGHT=${RENDER_PREVIEW_MAX_IN_FLIGHT:-8}');
     expect(compose).toContain('RENDER_PREVIEW_MAX_PER_USER=${RENDER_PREVIEW_MAX_PER_USER:-2}');
     expect(compose).toContain('mem_limit: ${RENDER_SERVICE_MEMORY_LIMIT:-8g}');
@@ -54,6 +57,16 @@ describe('render-service container contract', () => {
 
     const packageJson = read('package.json');
     expect(packageJson).toContain('"@hyperframes/producer": "^0.7.107"');
+  });
+
+  it('runs an init process as PID 1 so exited Chromium processes are reaped', () => {
+    const dockerfile = read('Dockerfile');
+
+    expect(dockerfile).toContain('TINI_VERSION=0.19.0-1+b3');
+    expect(dockerfile).toContain('"tini=${TINI_VERSION}"');
+    expect(dockerfile).toContain(
+      'ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/docker-entrypoint.sh"]',
+    );
   });
 
   it('prewarms the slide bundle before the server starts accepting requests', () => {

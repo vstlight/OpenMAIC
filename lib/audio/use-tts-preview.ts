@@ -1,21 +1,26 @@
 'use client';
 
 import { useState, useRef, useCallback, useEffect } from 'react';
-import {
-  ensureVoicesLoaded,
-  isBrowserTTSAbortError,
-  playBrowserTTSPreview,
-} from '@/lib/audio/browser-tts-preview';
+import { useI18n } from '@/lib/hooks/use-i18n';
+import { isBrowserTTSAbortError, playBrowserTTSPreview } from '@/lib/audio/browser-tts-preview';
 
 export interface TTSPreviewOptions {
   text: string;
+  /**
+   * The provider the voice belongs to: browser speech plays here, anything
+   * else is synthesized by the server with the `tts` slot's provider.
+   */
   providerId: string;
-  modelId?: string;
   voice: string;
   speed: number;
-  apiKey?: string;
-  baseUrl?: string;
   providerOptions?: unknown;
+  /**
+   * A saved provider to preview instead of the `tts` slot's (the settings'
+   * test of a service), with an optional model: the server uses its stored
+   * configuration.
+   */
+  previewProvider?: string;
+  previewModel?: string;
 }
 
 /**
@@ -26,6 +31,7 @@ export interface TTSPreviewOptions {
  * - `stopPreview()`: cancel any active preview and reset state
  */
 export function useTTSPreview() {
+  const { locale } = useI18n();
   const [previewing, setPreviewing] = useState(false);
   const cancelRef = useRef<(() => void) | null>(null);
   const requestIdRef = useRef(0);
@@ -69,19 +75,12 @@ export function useTTSPreview() {
       setPreviewing(true);
       try {
         if (options.providerId === 'browser-native-tts') {
-          if (typeof window === 'undefined' || !window.speechSynthesis) {
-            throw new Error('Browser does not support Speech Synthesis API');
-          }
-          const voices = await ensureVoicesLoaded();
-          if (isStale()) return;
-          if (voices.length === 0) {
-            throw new Error('No browser TTS voices available');
-          }
+          // Rejects when speech is unsupported or no voices load.
           const controller = playBrowserTTSPreview({
             text: options.text,
             voice: options.voice,
             rate: options.speed,
-            voices,
+            locale,
           });
           cancelRef.current = controller.cancel;
           await controller.promise;
@@ -96,14 +95,14 @@ export function useTTSPreview() {
         const body: Record<string, unknown> = {
           text: options.text,
           audioId: 'preview',
-          ttsProviderId: options.providerId,
-          ttsModelId: options.modelId,
           ttsVoice: options.voice,
           ttsSpeed: options.speed,
         };
-        if (options.apiKey?.trim()) body.ttsApiKey = options.apiKey;
-        if (options.baseUrl?.trim()) body.ttsBaseUrl = options.baseUrl;
         if (options.providerOptions) body.ttsProviderOptions = options.providerOptions;
+        if (options.previewProvider) {
+          body.previewProvider = options.previewProvider;
+          if (options.previewModel) body.previewModel = options.previewModel;
+        }
 
         const res = await fetch('/api/generate/tts', {
           method: 'POST',
@@ -116,7 +115,11 @@ export function useTTSPreview() {
         if (isStale()) return;
 
         if (!res.ok || !data.base64) {
-          throw new Error(data.error || 'TTS preview failed');
+          const error = new Error(data.error || 'TTS preview failed') as Error & {
+            errorCode?: string;
+          };
+          if (typeof data.errorCode === 'string') error.errorCode = data.errorCode;
+          throw error;
         }
 
         // Decode base64 → Blob → Object URL
@@ -154,7 +157,7 @@ export function useTTSPreview() {
         }
       }
     },
-    [cleanup],
+    [cleanup, locale],
   );
 
   return { previewing, startPreview, stopPreview };

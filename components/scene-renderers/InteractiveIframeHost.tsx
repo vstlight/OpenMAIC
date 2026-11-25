@@ -1,28 +1,36 @@
 'use client';
 
-import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, type CSSProperties } from 'react';
+import {
+  createInteractiveMediaSession,
+  mediaDocumentId,
+  MEDIA_CONTROL,
+} from '@/lib/interactive/media-bridge';
+import { createObservationSession } from '@/lib/interactive/observation-bridge';
 import { createPortal } from 'react-dom';
 import { useWidgetIframeStore } from '@/lib/store/widget-iframe';
 import {
   useInteractiveIframePool,
   type IframePoolEntry,
 } from '@/lib/store/interactive-iframe-pool';
-import { useSceneRuntimeErrors } from '@/lib/store/scene-runtime-errors';
+import { GENUI_LOGICAL_HEIGHT, GENUI_LOGICAL_WIDTH } from '@/lib/interactive/logical-viewport';
 import {
-  GENUI_LOGICAL_HEIGHT,
-  GENUI_LOGICAL_WIDTH,
-  fitGenUiViewport,
-} from '@/lib/interactive/logical-viewport';
+  GENUI_FIT_REPORT_REQUEST,
+  GENUI_FIT_SCROLL_REQUEST,
+  useGenUiFit,
+} from '@/lib/interactive/use-genui-fit';
 import { intersectClientBoxes } from '@/lib/edit/visible-client-rect';
 import { useCanvasStore } from '@/lib/store/canvas';
 import { useElementRefsStore } from '@/lib/store/element-refs';
 import { useI18n } from '@/lib/hooks/use-i18n';
+import { useFullscreenPortalTarget } from '@/lib/hooks/use-fullscreen-portal-target';
 import {
   ELEMENT_REF_SELECTOR_MAX,
   ELEMENT_SNAPSHOT_MAX,
   INTERACTIVE_OUTERHTML_MAX,
   makeInteractiveElementRef,
 } from '@/lib/workbench/element-refs';
+import { InteractiveMoreBelowCue } from './InteractiveMoreBelowCue';
 
 type InteractivePickerMessage = {
   __maicInteractive?: boolean;
@@ -136,10 +144,14 @@ export function handleInteractivePickerMessage(
  * zero-reload return.
  */
 export function InteractiveIframeHost({
+  portalContainer,
+  onMediaPlay,
   playbackPicker,
   onPlaybackPick,
   onPlaybackCancel,
 }: {
+  readonly portalContainer?: HTMLElement | null;
+  readonly onMediaPlay?: () => void;
   readonly playbackPicker?: PlaybackInteractivePickerState | null;
   readonly onPlaybackPick?: (pick: PlaybackInteractiveComponentPick) => void;
   readonly onPlaybackCancel?: () => void;
@@ -151,14 +163,8 @@ export function InteractiveIframeHost({
 
   // Portal into the fullscreen element when one is active (presentation mode
   // fullscreens the stage, and a body-portaled iframe would not be part of that
-  // subtree, so it would vanish). Falls back to body otherwise.
-  const [portalTarget, setPortalTarget] = useState<Element | null>(null);
-  useEffect(() => {
-    const sync = () => setPortalTarget(document.fullscreenElement ?? document.body);
-    sync();
-    document.addEventListener('fullscreenchange', sync);
-    return () => document.removeEventListener('fullscreenchange', sync);
-  }, []);
+  // subtree, so it would vanish). An explicit null waits for Stage to mount.
+  const portalTarget = useFullscreenPortalTarget(portalContainer);
 
   // Keep the messaging store's active scene in lock-step (its legacy fallback
   // path resolves the current widget by active scene when no id is passed).
@@ -178,6 +184,7 @@ export function InteractiveIframeHost({
       {Object.entries(entries).map(([sceneId, entry]) => (
         <PooledIframe
           key={sceneId}
+          onMediaPlay={onMediaPlay}
           sceneId={sceneId}
           entry={entry}
           visible={entry.owner !== null && sceneId === activeSceneId}
@@ -195,6 +202,7 @@ export function InteractiveIframeHost({
 }
 
 interface PooledIframeProps {
+  readonly onMediaPlay?: () => void;
   readonly sceneId: string;
   readonly entry: IframePoolEntry;
   readonly visible: boolean;
@@ -222,6 +230,7 @@ interface PooledIframeProps {
  * targetOrigin='*'.
  */
 function PooledIframe({
+  onMediaPlay,
   sceneId,
   entry,
   visible,
@@ -232,7 +241,76 @@ function PooledIframe({
 }: PooledIframeProps) {
   const { t } = useI18n();
   const iframeRef = useRef<HTMLIFrameElement>(null);
+  const mediaSession = useRef<ReturnType<typeof createInteractiveMediaSession> | null>(null);
+  const mediaId = mediaDocumentId(entry.srcDoc);
+  useLayoutEffect(() => {
+    if (!iframeRef.current || !mediaId || !visible) return;
+    const session = createInteractiveMediaSession(iframeRef.current, mediaId, () =>
+      onMediaPlay?.(),
+    );
+    mediaSession.current = session;
+    return () => {
+      session.dispose();
+      mediaSession.current = null;
+    };
+  }, [mediaId, onMediaPlay, visible]);
+  // `srcDoc` already carries every shim, the observation reader included; the
+  // reader is installed for each pooled document and one that publishes no
+  // outlet answers `no-interface`. This reads the identity baked into that
+  // document rather than minting a second, disagreeing one.
+  const observation = { html: entry.srcDoc, identity: entry.observationIdentity };
+  const observationSession = useRef<ReturnType<typeof createObservationSession> | null>(null);
+  const registerObservation = useWidgetIframeStore((s) => s.registerObservation);
+  useLayoutEffect(() => {
+    observationSession.current?.dispose();
+    observationSession.current = null;
+    registerObservation(sceneId, async (sourceHtml, signal) => {
+      const pool = useInteractiveIframePool.getState();
+      const current = pool.entries[sceneId];
+      if (
+        pool.activeSceneId !== sceneId ||
+        !current?.owner ||
+        current.sourceHtml !== sourceHtml ||
+        current.srcDoc !== entry.srcDoc
+      )
+        return undefined;
+      const session = observationSession.current;
+      if (!session) return undefined;
+      const moved = new AbortController();
+      const unsubscribe = useInteractiveIframePool.subscribe((next) => {
+        if (
+          next.activeSceneId !== sceneId ||
+          next.entries[sceneId]?.owner !== current.owner ||
+          next.entries[sceneId]?.srcDoc !== entry.srcDoc
+        )
+          moved.abort();
+      });
+      let result;
+      try {
+        result = await session.capture({ signal: AbortSignal.any([signal, moved.signal]) });
+      } finally {
+        unsubscribe();
+      }
+      if (moved.signal.aborted) return undefined;
+      const latest = useInteractiveIframePool.getState();
+      if (
+        latest.activeSceneId !== sceneId ||
+        !latest.entries[sceneId]?.owner ||
+        latest.entries[sceneId]?.srcDoc !== entry.srcDoc ||
+        observationSession.current !== session ||
+        !session.isActive()
+      )
+        return undefined;
+      return result;
+    });
+    return () => {
+      observationSession.current?.dispose();
+      observationSession.current = null;
+      registerObservation(sceneId, null);
+    };
+  }, [sceneId, entry.srcDoc, registerObservation]);
   const registerIframe = useWidgetIframeStore((s) => s.registerIframe);
+  const markIframeReady = useWidgetIframeStore((s) => s.markIframeReady);
   const getSendMessage = useWidgetIframeStore((s) => s.getSendMessage);
   const pickTarget = useCanvasStore.use.pickTarget();
   const refs = useElementRefsStore.use.refs();
@@ -245,17 +323,29 @@ function PooledIframe({
       ),
     [refs, sceneId],
   );
+  const documentToken = entry.srcDoc ? `srcDoc:${entry.srcDoc}` : `src:${entry.src ?? ''}`;
+  const rect = entry.rect;
+  const fit = useGenUiFit(rect, documentToken);
+  const handleFitMessage = fit.handleMessage;
+  // A new fit key restarts the fit; the page only re-posts when its own size
+  // changes, so ask for its current extent.
+  useEffect(() => {
+    iframeRef.current?.contentWindow?.postMessage(GENUI_FIT_REPORT_REQUEST, '*');
+  }, [fit.fitKey]);
 
   // Register the postMessage callback for this scene (moved here from the
   // placeholder, since the iframe now lives in the host). Stable per scene:
   // the callback reads contentWindow lazily at send time.
-  useEffect(() => {
+  useLayoutEffect(() => {
     const send = (type: string, payload: Record<string, unknown>) => {
+      if (type === MEDIA_CONTROL) {
+        mediaSession.current?.pause();
+        return;
+      }
       iframeRef.current?.contentWindow?.postMessage({ type, ...payload }, '*');
     };
-    registerIframe(sceneId, send);
-    return () => registerIframe(sceneId, null);
-  }, [sceneId, registerIframe]);
+    return registerIframe(sceneId, send, documentToken);
+  }, [documentToken, sceneId, registerIframe]);
 
   useEffect(() => {
     const send = getSendMessage(sceneId);
@@ -276,29 +366,12 @@ function PooledIframe({
     });
   }, [effectiveMode, entry.srcDoc, getSendMessage, playbackSelectedSelector, sceneId, selectors]);
 
-  // Capture runtime errors the iframe's error shim posts out (see iframe.ts), so
-  // the editor agent can diagnose a blank/broken page. Matched to THIS iframe by
-  // event.source (sandboxed null-origin iframes still postMessage to the parent).
-  //
-  // The errors that matter most (a JSON.parse that aborts setup) fire while srcDoc
-  // parses — possibly BEFORE this passive effect subscribes. The shim buffers every
-  // error and re-emits it on request, so after subscribing we ask for a replay to
-  // recover anything posted pre-subscription. Re-subscribed per document version
-  // (entry.srcDoc) so each fresh page gets its own replay request; addError dedups
-  // the live + replayed copies. iframeRef is read lazily, so the handler is stable.
   useEffect(() => {
     const onMessage = (e: MessageEvent) => {
       if (e.source !== iframeRef.current?.contentWindow) return;
-      const d = e.data as
-        | (InteractivePickerMessage & { errorKind?: string; message?: unknown })
-        | undefined;
-      if (!d || d.__maicInteractive !== true) return;
-      if (d.kind === 'runtime-error') {
-        const kind = typeof d.errorKind === 'string' ? d.errorKind : 'error';
-        const msg = typeof d.message === 'string' ? d.message : String(d.message ?? '');
-        useSceneRuntimeErrors.getState().addError(sceneId, `[${kind}] ${msg}`);
-        return;
-      }
+      if (handleFitMessage(e.data)) return;
+      const d = e.data as InteractivePickerMessage | undefined;
+      if (!d || d.__maicInteractive !== true || d.kind === 'runtime-error') return;
       if (
         onPlaybackPick &&
         onPlaybackCancel &&
@@ -315,19 +388,23 @@ function PooledIframe({
       if (effectiveMode === 'editor') handleInteractivePickerMessage(sceneId, d, t);
     };
     window.addEventListener('message', onMessage);
-    iframeRef.current?.contentWindow?.postMessage({ __maicErrorReplayRequest: true }, '*');
+    iframeRef.current?.contentWindow?.postMessage(GENUI_FIT_REPORT_REQUEST, '*');
     return () => window.removeEventListener('message', onMessage);
-  }, [sceneId, entry.srcDoc, effectiveMode, onPlaybackCancel, onPlaybackPick, playbackArmed, t]);
+  }, [
+    sceneId,
+    entry.srcDoc,
+    effectiveMode,
+    handleFitMessage,
+    onPlaybackCancel,
+    onPlaybackPick,
+    playbackArmed,
+    t,
+  ]);
 
-  // A content change reloads the iframe; drop the previous render's errors so the
-  // captured set reflects the CURRENT page (e.g. after the agent applies a fix).
-  useEffect(() => {
-    useSceneRuntimeErrors.getState().clearScene(sceneId);
-  }, [sceneId, entry.srcDoc]);
-
-  const rect = entry.rect;
   const clip = entry.clip ?? rect;
-  const viewport = rect ? fitGenUiViewport(rect) : null;
+  // Fitted to the slot and to the content extent the page reports: a page
+  // larger than its viewport is shrunk (down to a floor) so it fits unscrolled.
+  const viewport = fit.viewport;
   const visibleViewport = viewport && clip ? intersectClientBoxes(viewport.box, clip) : null;
   // Require a real measured box before showing — a null or zero-size rect means
   // the slot hasn't laid out yet; showing then would flash a 0x0 iframe pinned
@@ -358,23 +435,38 @@ function PooledIframe({
     position: 'absolute',
     left: viewport && visibleViewport ? viewport.box.left - visibleViewport.left : 0,
     top: viewport && visibleViewport ? viewport.box.top - visibleViewport.top : 0,
-    width: GENUI_LOGICAL_WIDTH,
-    height: GENUI_LOGICAL_HEIGHT,
+    width: viewport?.width ?? GENUI_LOGICAL_WIDTH,
+    height: viewport?.height ?? GENUI_LOGICAL_HEIGHT,
     border: 0,
     transform: `scale(${viewport?.scale ?? 0})`,
     transformOrigin: 'top left',
   };
 
   return (
-    <div style={wrapStyle}>
+    <div className="interactive-iframe-viewport" style={wrapStyle}>
       <iframe
         ref={iframeRef}
-        srcDoc={entry.srcDoc}
+        srcDoc={observation.html}
+        onLoad={() => {
+          observationSession.current?.dispose();
+          observationSession.current =
+            iframeRef.current && observation.identity
+              ? createObservationSession(iframeRef.current, observation.identity)
+              : null;
+          markIframeReady(sceneId);
+        }}
         src={entry.srcDoc ? undefined : entry.src}
         style={iframeStyle}
         title={`Interactive Scene ${sceneId}`}
         sandbox="allow-scripts allow-forms allow-popups"
       />
+      {shown && fit.showMoreCue && !playbackArmed ? (
+        <InteractiveMoreBelowCue
+          onClick={() =>
+            iframeRef.current?.contentWindow?.postMessage(GENUI_FIT_SCROLL_REQUEST, '*')
+          }
+        />
+      ) : null}
       {playbackArmed && (
         <div
           data-testid="interactive-element-pick-instruction"

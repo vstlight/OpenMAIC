@@ -22,7 +22,7 @@ const mocks = vi.hoisted(() => ({
     agentVoiceOverrides: {},
   },
   browserOptions: {} as UseBrowserTTSOptions,
-  speak: vi.fn(),
+  speak: vi.fn<(text: string, voice?: string) => Promise<boolean>>(),
   pause: vi.fn(),
   resume: vi.fn(),
   cancel: vi.fn(),
@@ -33,6 +33,18 @@ const mocks = vi.hoisted(() => ({
 vi.mock('@/lib/store/settings', () => ({
   useSettingsStore: (selector: (state: typeof mocks.settings) => unknown) =>
     selector(mocks.settings),
+}));
+// The providers the voices may come from. The workspace's tts slot names one;
+// the queue logic under test is the same for any set, so these tests offer
+// several (a browser and two server providers) to exercise the ordering.
+const selection = {
+  providerId: mocks.settings.ttsProviderId,
+  voice: mocks.settings.ttsVoice,
+  speed: 1,
+  providersConfig: mocks.settings.ttsProvidersConfig,
+};
+vi.mock('@/lib/audio/use-tts-selection', () => ({
+  useTTSSelection: () => selection,
 }));
 vi.mock('@/lib/hooks/use-i18n', () => ({
   useI18n: () => ({ locale: 'en', t: (key: string) => key }),
@@ -56,26 +68,64 @@ vi.mock('@/lib/hooks/use-browser-tts', () => ({
   },
 }));
 
+import { PBL_NARRATORS } from '@/lib/pbl/v3/personas';
 import { useDiscussionTTS } from '@/lib/hooks/use-discussion-tts';
 import { clearUnavailableVoiceBindingsForTests } from '@/lib/audio/unavailable-voice-bindings';
+import { resetDiscussionAudioElementForTests } from '@/lib/audio/discussion-audio';
 
 Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
 
 class FakeAudio extends EventTarget {
   static instances: FakeAudio[] = [];
   playbackRate = 1;
+  defaultPlaybackRate = 1;
   volume = 1;
   paused = true;
+  /** Mirrors a real media element, where `onended`/`onerror` fire on the event. */
+  onended: ((event?: Event) => void) | null = null;
+  onerror: ((event?: Event) => void) | null = null;
   play = vi.fn(async () => {
     this.paused = false;
   });
   pause = vi.fn(() => {
     this.paused = true;
   });
+  private srcAttribute: string | null = null;
 
-  constructor(public src: string) {
+  constructor(src?: string) {
     super();
+    if (src !== undefined) this.srcAttribute = src;
     FakeAudio.instances.push(this);
+  }
+
+  /**
+   * `src` behaves like the real property: with no source attribute it reads as
+   * ''. Assigning one reloads the element, which resets `playbackRate` to
+   * `defaultPlaybackRate` — the reason the hook re-applies speed per line.
+   */
+  get src(): string {
+    return this.srcAttribute ?? '';
+  }
+
+  set src(value: string) {
+    this.srcAttribute = value;
+    this.playbackRate = this.defaultPlaybackRate;
+  }
+
+  /** Mirrors removeAttribute('src'): the element is left with no source. */
+  removeAttribute(name: string): void {
+    if (name === 'src') this.srcAttribute = null;
+  }
+
+  /** Mirrors load(); the stub has nothing to fetch. */
+  load = vi.fn(() => {
+    this.paused = true;
+  });
+
+  override dispatchEvent(event: Event): boolean {
+    const handler = (this as unknown as Record<string, unknown>)[`on${event.type}`];
+    if (typeof handler === 'function') (handler as (event: Event) => void).call(this, event);
+    return super.dispatchEvent(event);
   }
 
   end() {
@@ -132,8 +182,11 @@ async function respond(index: number, body = { base64: btoa(`audio-${index}`), f
 beforeEach(() => {
   vi.clearAllMocks();
   clearUnavailableVoiceBindingsForTests();
+  resetDiscussionAudioElementForTests();
   mocks.voiceOptions.mockResolvedValue(undefined);
+  mocks.speak.mockResolvedValue(true);
   mocks.settings.ttsMuted = false;
+  mocks.settings.ttsSpeed = 1;
   mocks.settings.ttsVolume = 0.7;
   mocks.settings.playbackSpeed = 1;
   requests.length = 0;
@@ -163,6 +216,36 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+describe('PBL tutor voices', () => {
+  beforeEach(() => {
+    agents = PBL_NARRATORS;
+  });
+  afterEach(() => {
+    selection.providerId = mocks.settings.ttsProviderId;
+    selection.voice = mocks.settings.ttsVoice;
+  });
+
+  it.each(['mentor', 'discussion', 'planner', 'coder'])(
+    'synthesizes %s with the selected narrator voice even when browser speech is available',
+    async (role) => {
+      selection.voice = 'nova';
+      act(() => root.render(createElement(Probe)));
+      await seal('one', role);
+      expect(requests.map((r) => r.body.ttsVoice)).toEqual(['nova']);
+      expect(mocks.speak).not.toHaveBeenCalled();
+    },
+  );
+
+  it('uses browser speech when the platform selects it', async () => {
+    selection.providerId = 'browser-native-tts';
+    selection.voice = 'selected-browser-voice';
+    act(() => root.render(createElement(Probe)));
+    await seal('one', 'planner');
+    expect(mocks.speak).toHaveBeenCalledWith('Sentence one.', 'selected-browser-voice');
+    expect(requests).toHaveLength(0);
+  });
+});
+
 describe('discussion TTS synthesis lookahead', () => {
   it('requests B during A playback and consumes the prepared result exactly once', async () => {
     await seal('A');
@@ -178,10 +261,12 @@ describe('discussion TTS synthesis lookahead', () => {
 
     await act(async () => FakeAudio.instances[0].end());
     expect(requests).toHaveLength(2);
-    expect(FakeAudio.instances[1].src).toContain(btoa('audio-1'));
-    expect(FakeAudio.instances[1].play).toHaveBeenCalledOnce();
+    // One element is reused: the second line shows up as a new src on it.
+    expect(FakeAudio.instances).toHaveLength(1);
+    expect(FakeAudio.instances[0].src).toContain(btoa('audio-1'));
+    expect(FakeAudio.instances[0].play).toHaveBeenCalledTimes(2);
     expect(hook.shouldHold()).toEqual({ holding: true, segmentDone: 1 });
-    await act(async () => FakeAudio.instances[1].end());
+    await act(async () => FakeAudio.instances[0].end());
     expect(hook.shouldHold()).toEqual({ holding: false, segmentDone: 2 });
   });
 
@@ -197,7 +282,7 @@ describe('discussion TTS synthesis lookahead', () => {
 
     await act(async () => FakeAudio.instances[0].end());
     expect(requests.map((r) => r.body.audioId)).toEqual(['A', 'B', 'C']);
-    expect(FakeAudio.instances).toHaveLength(2);
+    expect(FakeAudio.instances).toHaveLength(1);
   });
 
   it('ignores an old response after cleanup, even if the transport ignores abort', async () => {
@@ -223,7 +308,8 @@ describe('discussion TTS synthesis lookahead', () => {
     expect(FakeAudio.instances).toHaveLength(1);
     expect(stateChange).toHaveBeenLastCalledWith('teacher', 'generating');
     await respond(1);
-    expect(FakeAudio.instances[1].play).toHaveBeenCalledOnce();
+    expect(FakeAudio.instances).toHaveLength(1);
+    expect(FakeAudio.instances[0].play).toHaveBeenCalledTimes(2);
     expect(requests.map((r) => r.body.audioId)).toEqual(['A', 'B', 'C']);
   });
 
@@ -246,8 +332,61 @@ describe('discussion TTS synthesis lookahead', () => {
     await act(async () => FakeAudio.instances[0].end());
     expect(FakeAudio.instances).toHaveLength(1);
     await act(async () => hook.resume());
-    expect(FakeAudio.instances[1].play).toHaveBeenCalledOnce();
+    expect(FakeAudio.instances[0].play).toHaveBeenCalledTimes(2);
     expect(requests).toHaveLength(2);
+  });
+
+  it('ignores a rejected resume that arrives after cleanup, with no line playing', async () => {
+    await seal('A');
+    await respond(0);
+    const audio = FakeAudio.instances[0];
+    act(() => hook.pause());
+    let rejectResume!: (reason: unknown) => void;
+    audio.play.mockImplementationOnce(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectResume = reject;
+        }),
+    );
+    act(() => hook.resume());
+    act(() => hook.cleanup());
+    // The lesson is gone: the stale rejection must not count a segment done or
+    // restart the queue it just cleared.
+    await act(async () => {
+      rejectResume(new Error('play rejected'));
+    });
+    expect(audio.paused).toBe(true);
+    expect(hook.shouldHold()).toEqual({ holding: false, segmentDone: 0 });
+    expect(FakeAudio.instances).toHaveLength(1);
+  });
+
+  it('ignores a play() rejection from a line that no longer owns the element', async () => {
+    await seal('A');
+    await seal('B');
+    await respond(0);
+    const audio = FakeAudio.instances[0];
+    act(() => hook.pause());
+    // Resume with a play() that has not settled yet, then drop the lesson and
+    // let a new line take the element; the rejection arrives afterwards.
+    let rejectResume!: (reason: unknown) => void;
+    audio.play.mockImplementationOnce(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectResume = reject;
+        }),
+    );
+    act(() => hook.resume());
+    act(() => hook.cleanup());
+    await seal('C');
+    await respond(2);
+    expect(FakeAudio.instances).toHaveLength(1);
+    expect(audio.src).toContain(btoa('audio-2'));
+    await act(async () => {
+      rejectResume(new Error('play rejected'));
+    });
+    // Line C keeps the element: the rejected resume belonged to line A.
+    expect(audio.paused).toBe(false);
+    expect(hook.shouldHold()).toEqual({ holding: true, segmentDone: 0 });
   });
 
   it('aborts lookahead on cleanup and ignores stale audio events and failures', async () => {
@@ -255,19 +394,32 @@ describe('discussion TTS synthesis lookahead', () => {
     await seal('B');
     await respond(0);
     const oldAudio = FakeAudio.instances[0];
+    // The handlers of the line that was playing, captured before cleanup — what
+    // a late event from that line amounts to once the element is reused.
+    const staleEnded = oldAudio.onended;
+    const staleError = oldAudio.onerror;
     act(() => hook.cleanup());
     expect(requests[1].signal.aborted).toBe(true);
     expect(oldAudio.paused).toBe(true);
     expect(oldAudio.src).toBe('');
+    expect(oldAudio.onended).toBeNull();
+    expect(oldAudio.onerror).toBeNull();
+    // Leaving the element on an empty src would point it at the page's own URL
+    // and start a load that fails later; the source attribute goes instead.
+    expect(oldAudio.load).toHaveBeenCalled();
     await seal('new');
     await respond(2);
+    expect(FakeAudio.instances[0].src).toContain(btoa('audio-2'));
     await act(async () => {
+      // A late failure from the aborted lookahead and the previous line's own
+      // events: none of them may finish the line that owns the element now.
       requests[1].response.reject(new Error('late failure'));
-      oldAudio.end();
-      oldAudio.dispatchEvent(new Event('error'));
+      staleEnded?.();
+      staleError?.();
     });
-    expect(FakeAudio.instances).toHaveLength(2);
-    expect(FakeAudio.instances[1].paused).toBe(false);
+    expect(FakeAudio.instances).toHaveLength(1);
+    expect(FakeAudio.instances[0].paused).toBe(false);
+    expect(FakeAudio.instances[0].src).toContain(btoa('audio-2'));
     expect(hook.shouldHold()).toEqual({ holding: true, segmentDone: 0 });
   });
 
@@ -310,8 +462,9 @@ describe('discussion TTS synthesis lookahead', () => {
     expect(requests.map((r) => r.body.audioId)).toEqual(['A', 'B', 'B']);
     await respond(2);
     await act(async () => audio.end());
-    expect(FakeAudio.instances[1].src).toContain(btoa('audio-2'));
-    expect(FakeAudio.instances[1].play).toHaveBeenCalledOnce();
+    expect(FakeAudio.instances).toHaveLength(1);
+    expect(audio.src).toContain(btoa('audio-2'));
+    expect(audio.play).toHaveBeenCalledTimes(2);
   });
 
   it('does not send a request after cancellation during voice-option resolution', async () => {
@@ -353,7 +506,8 @@ describe('discussion TTS synthesis lookahead', () => {
     expect(log).toHaveBeenCalledOnce();
     expect(requests.map((r) => r.body.audioId)).toEqual(['A', 'B', 'C']);
     await respond(2);
-    expect(FakeAudio.instances[1].src).toContain(btoa('audio-2'));
+    expect(FakeAudio.instances).toHaveLength(1);
+    expect(FakeAudio.instances[0].src).toContain(btoa('audio-2'));
     expect(hook.shouldHold()).toEqual({ holding: true, segmentDone: 2 });
   });
 
@@ -386,11 +540,43 @@ describe('discussion TTS synthesis lookahead', () => {
     expect(mocks.warning).not.toHaveBeenCalled();
     await act(async () => FakeAudio.instances[0].end());
     expect(requests.map((r) => r.body.audioId)).toEqual(['A', 'B', 'B']);
-    expect(requests[2].body).toMatchObject({ ttsProviderId: 'openai-tts', ttsVoice: 'alloy' });
+    expect(requests[2].body).toMatchObject({ ttsVoice: 'alloy' });
+    expect(requests[2].body).not.toHaveProperty('ttsProviderId');
     expect(hook.shouldHold()).toEqual({ holding: true, segmentDone: 1 });
     expect(mocks.warning).toHaveBeenCalledOnce();
     await respond(2);
-    await act(async () => FakeAudio.instances[1].end());
+    await act(async () => FakeAudio.instances[0].end());
+    expect(hook.shouldHold()).toEqual({ holding: false, segmentDone: 2 });
+  });
+
+  it('shows reclone guidance for an incompatible saved voice without queuing a substitute', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    agents = [
+      teacher,
+      {
+        ...teacher,
+        id: 'clone-teacher',
+        voiceConfig: { providerId: 'qwen-tts', voiceId: 'qwen-tts-vc-retired-id' },
+      },
+    ];
+    act(() => root.render(createElement(Probe)));
+    await seal('A');
+    await seal('B', 'clone-teacher');
+    await respond(0);
+    await act(async () =>
+      requests[1].response.resolve(
+        Response.json(
+          {
+            error: 'Re-clone this saved voice',
+            errorCode: 'QWEN_VC_RECLONE_REQUIRED',
+          },
+          { status: 400 },
+        ),
+      ),
+    );
+    await act(async () => FakeAudio.instances[0].end());
+    expect(requests.map((r) => r.body.audioId)).toEqual(['A', 'B']);
+    expect(mocks.warning).toHaveBeenCalledExactlyOnceWith('settings.qwenCloneMigrationHint');
     expect(hook.shouldHold()).toEqual({ holding: false, segmentDone: 2 });
   });
 
@@ -419,7 +605,46 @@ describe('discussion TTS synthesis lookahead', () => {
     act(() => mocks.browserOptions.onEnd?.());
     expect(FakeAudio.instances).toHaveLength(1);
     await act(async () => hook.resume());
-    expect(FakeAudio.instances[1].play).toHaveBeenCalledOnce();
+    expect(FakeAudio.instances).toHaveLength(1);
+    expect(FakeAudio.instances[0].play).toHaveBeenCalledTimes(2);
+  });
+
+  it('finishes a browser line that cannot be spoken and moves on to the next one', async () => {
+    agents = [
+      teacher,
+      {
+        ...teacher,
+        id: 'browser-teacher',
+        voiceConfig: { providerId: 'browser-native-tts', voiceId: 'browser-voice' },
+      },
+    ];
+    act(() => root.render(createElement(Probe)));
+    mocks.speak.mockResolvedValueOnce(false);
+    await seal('A', 'browser-teacher');
+    await seal('B', 'browser-teacher');
+    expect(mocks.speak.mock.calls.map(([text]) => text)).toEqual(['Sentence A.', 'Sentence B.']);
+    expect(hook.shouldHold()).toEqual({ holding: true, segmentDone: 1 });
+    act(() => mocks.browserOptions.onEnd?.());
+    expect(hook.shouldHold()).toEqual({ holding: false, segmentDone: 2 });
+  });
+
+  it('gives browser speech the discussion speed, volume, mute and language', async () => {
+    mocks.settings.ttsSpeed = 1.5;
+    mocks.settings.playbackSpeed = 2;
+    mocks.settings.ttsVolume = 0.4;
+    act(() => root.render(createElement(Probe)));
+    expect(mocks.browserOptions.getSettings?.()).toEqual({
+      locale: 'en',
+      rate: 3,
+      volume: 0.4,
+      muted: false,
+    });
+
+    // Read per sentence: a later change shows up on the next read.
+    mocks.settings.ttsMuted = true;
+    mocks.settings.playbackSpeed = 1;
+    act(() => root.render(createElement(Probe)));
+    expect(mocks.browserOptions.getSettings?.()).toMatchObject({ rate: 1.5, muted: true });
   });
 
   it('applies current playback speed and volume when consuming prepared audio', async () => {
@@ -432,8 +657,11 @@ describe('discussion TTS synthesis lookahead', () => {
     act(() => root.render(createElement(Probe)));
     expect(FakeAudio.instances[0].playbackRate).toBe(1.5);
     await act(async () => FakeAudio.instances[0].end());
-    expect(FakeAudio.instances[1].playbackRate).toBe(1.5);
-    expect(FakeAudio.instances[1].volume).toBe(0.3);
+    // Same element for the second line: settings are re-applied per line.
+    expect(FakeAudio.instances).toHaveLength(1);
+    expect(FakeAudio.instances[0].src).toContain(btoa('audio-1'));
+    expect(FakeAudio.instances[0].playbackRate).toBe(1.5);
+    expect(FakeAudio.instances[0].volume).toBe(0.3);
   });
 
   it('advances once if playback errors, even if an ended event arrives afterward', async () => {
@@ -446,8 +674,8 @@ describe('discussion TTS synthesis lookahead', () => {
       audio.dispatchEvent(new Event('error'));
       audio.end();
     });
-    expect(FakeAudio.instances).toHaveLength(2);
-    expect(FakeAudio.instances[1].play).toHaveBeenCalledOnce();
+    expect(FakeAudio.instances).toHaveLength(1);
+    expect(FakeAudio.instances[0].play).toHaveBeenCalledTimes(2);
     expect(hook.shouldHold()).toEqual({ holding: true, segmentDone: 1 });
   });
 
@@ -459,7 +687,91 @@ describe('discussion TTS synthesis lookahead', () => {
     act(() => hook.pause());
     FakeAudio.instances[0].play.mockRejectedValueOnce(new Error('play rejected'));
     await act(async () => hook.resume());
-    expect(FakeAudio.instances[1].play).toHaveBeenCalledOnce();
+    // Reused element: line A, the refused resume attempt, then line B — all on
+    // the one element, which is why the count is three rather than two.
+    expect(FakeAudio.instances).toHaveLength(1);
+    expect(FakeAudio.instances[0].play).toHaveBeenCalledTimes(3);
     expect(hook.shouldHold()).toEqual({ holding: true, segmentDone: 1 });
+  });
+});
+
+/**
+ * Mobile autoplay policy for discussion narration.
+ *
+ * Mobile browsers only let a programmatic `play()` through on the element a
+ * user gesture has already reached. A player that mints one element per
+ * discussion line therefore goes silent from the second line on — the lesson
+ * keeps advancing while the speech is refused with NotAllowedError.
+ */
+describe('discussion TTS under a mobile autoplay policy', () => {
+  /**
+   * Mobile rule: activation is per element and sticky. An element that has never
+   * played is refused; the first element stands in for the one the user's gesture
+   * reached, so it is allowed to play once.
+   *
+   * What this can and cannot show: it shows that one element serves every line
+   * instead of one per line (the bug), and it shows the hook's behaviour when a
+   * play() is refused. It cannot show that the first play() of the discussion
+   * element is allowed on a real device — that element is created after an
+   * awaited TTS fetch, so whether the mobile rule covers it is a question only a
+   * device can answer.
+   */
+  class PolicyAudio extends FakeAudio {
+    activated = false;
+    play = vi.fn(async () => {
+      if (!this.activated) {
+        throw Object.assign(new Error('play() failed because the user did not interact'), {
+          name: 'NotAllowedError',
+        });
+      }
+      this.paused = false;
+    });
+
+    constructor(src?: string) {
+      super(src);
+      // `super()` registers this instance, so the first element created is the
+      // one the gesture reached.
+      this.activated = FakeAudio.instances.length === 1;
+    }
+  }
+
+  beforeEach(() => {
+    // Re-render with the policy stub so element creation is governed by it.
+    resetDiscussionAudioElementForTests();
+    act(() => root.unmount());
+    vi.stubGlobal('Audio', PolicyAudio);
+    root = createRoot(document.createElement('div'));
+    act(() => root.render(createElement(Probe)));
+  });
+
+  it('plays every line through the single element the gesture unlocked', async () => {
+    await seal('A');
+    await seal('B');
+    await respond(0);
+    await respond(1);
+    const audio = FakeAudio.instances[0];
+    expect(audio.play).toHaveBeenCalledOnce();
+    await act(async () => audio.end());
+    expect(FakeAudio.instances).toHaveLength(1);
+    expect(audio.src).toContain(btoa('audio-1'));
+    expect(audio.play).toHaveBeenCalledTimes(2);
+    expect(hook.shouldHold()).toEqual({ holding: true, segmentDone: 1 });
+    await act(async () => audio.end());
+    expect(hook.shouldHold()).toEqual({ holding: false, segmentDone: 2 });
+  });
+
+  it('keeps pause and resume on the reused element', async () => {
+    await seal('A');
+    await seal('B');
+    await respond(0);
+    await respond(1);
+    const audio = FakeAudio.instances[0];
+    act(() => hook.pause());
+    expect(audio.pause).toHaveBeenCalledOnce();
+    await act(async () => hook.resume());
+    expect(audio.play).toHaveBeenCalledTimes(2);
+    await act(async () => audio.end());
+    expect(audio.src).toContain(btoa('audio-1'));
+    expect(audio.play).toHaveBeenCalledTimes(3);
   });
 });

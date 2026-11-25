@@ -3,16 +3,13 @@
  *
  * New audio receives an allocated pool identity from `generateAndStoreTTS`.
  * The old `tts_s<sceneOrder>_<actionId>` shape remains only as a compatibility
- * read/delete key for documents and Dexie rows created before allocation.
+ * read/delete key for documents and cached rows created before allocation.
  */
-import { db } from '@/lib/utils/database';
-import { useSettingsStore } from '@/lib/store/settings';
-import { generateAndStoreTTS } from '@/lib/hooks/use-scene-generator';
+import { db } from '@/lib/device-storage/database';
+import { serverTTSAvailable } from '@/lib/audio/tts-selection';
+import { generateAndStoreTTS } from '@/lib/audio/narration-tts';
 import { useStageStore } from '@/lib/store/stage';
-import { proveExclusiveAssetOwnership } from '@/lib/media/collect-stage-asset-refs';
 import { resolveAudioBlob } from '@/lib/media/resolve-audio-bytes';
-import { assetRefExists } from '@/lib/media/use-asset-url';
-import { mayNameAPoolAsset } from '@/lib/media/media-placeholder';
 import { mayGenerateForStage } from '@/lib/classroom/generation-permission';
 
 /** Legacy deterministic Dexie key used before pool allocation. */
@@ -41,10 +38,12 @@ export async function resolveLegacySpeechAudioId(
   return (await db.audioFiles.get(legacyId)) ? legacyId : undefined;
 }
 
-/** Managed (server) TTS is on — browser-native TTS has no cached file to manage. */
+/**
+ * Managed (server) TTS is on: the workspace's tts slot resolves to a provider
+ * other than browser speech, which has no cached file to manage.
+ */
 export function isManagedTtsActive(): boolean {
-  const s = useSettingsStore.getState();
-  return s.ttsEnabled && s.ttsProviderId !== 'browser-native-tts';
+  return serverTTSAvailable();
 }
 
 /** True if an audio blob is cached under this exact audioId. */
@@ -70,52 +69,11 @@ export async function audioObjectUrl(audioId: string): Promise<string | null> {
 }
 
 /**
- * Discard the cached audio for a speech line — its stamped audioId (the
- * allocated pool identity, when present) and the legacy derived key — so the
- * line reads as "not voiced" until regenerated. Called when the user edits a
- * line's text: the cached audio is keyed by sceneOrder+actionId and the
- * stamped id, not the text, so without this the stale blob would keep
- * replaying for the new wording. Only the local compatibility copy is removed
- * here. The pool bytes are left in place and nothing reclaims them: the
- * stage-scoped registry sweep is written but not wired up, so an unreferenced
- * pool entry survives.
- */
-export async function discardSpeechAudio(
-  sceneOrder: number,
-  action: { id?: string; audioId?: string },
-): Promise<void> {
-  if (!action.id) return;
-  const ids = new Set([speechAudioId(sceneOrder, action.id)]);
-  if (action.audioId) ids.add(action.audioId);
-  await db.audioFiles.bulkDelete([...ids]);
-}
-
-/**
- * The current audio id when it is pool-backed and provably owned by this stage
- * alone, so its bytes may be replaced in place; undefined otherwise.
- */
-async function exclusivelyOwnedAudioId(
-  audioId: string | undefined,
-  stageId: string | undefined,
-): Promise<string | undefined> {
-  if (!audioId || !stageId) return undefined;
-  // A derived key was never allocated, so probing the pool for it is a
-  // guaranteed miss — and a real request once the pool is server-backed.
-  if (!mayNameAPoolAsset(audioId)) return undefined;
-  if (!(await assetRefExists(audioId))) return undefined;
-  const { exclusive } = await proveExclusiveAssetOwnership(audioId, stageId);
-  return exclusive ? audioId : undefined;
-}
-
-/**
  * (Re)generate TTS for one speech line.
  *
- * A clip this line exclusively owns keeps its id and has its bytes replaced, so
- * references stay valid and no orphan entry or compatibility row is left behind
- * — the same rule media retries follow. A clip shared with another element or
- * document, or one whose ownership cannot be proven, gets a fresh allocation so
- * the other holders keep their audio. Returns the id on success, or null when
- * TTS isn't applicable.
+ * The clip always gets a fresh allocation (see `generateAndStoreTTS`): another
+ * document may hold the old id, and no browser can prove it does not. Returns
+ * the id on success, or null when TTS isn't applicable.
  */
 export async function regenerateSpeechAudio(
   sceneOrder: number,
@@ -132,14 +90,5 @@ export async function regenerateSpeechAudio(
   // asset, so it is gated exactly like every other way generation starts. The
   // surfaces withhold the control too; refusing here keeps the two one rule.
   if (!mayGenerateForStage(stageId)) return null;
-  const existingAudioId = await exclusivelyOwnedAudioId(action.audioId, stageId);
-  return generateAndStoreTTS(
-    requestId,
-    text,
-    language,
-    signal,
-    undefined,
-    existingAudioId,
-    stageId,
-  );
+  return generateAndStoreTTS(requestId, text, language, signal, undefined, stageId);
 }

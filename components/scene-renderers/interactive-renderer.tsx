@@ -1,10 +1,34 @@
 'use client';
 
-import { useId, useMemo, useRef, useEffect } from 'react';
+import { useId, useRef, useEffect } from 'react';
 import type { InteractiveContent } from '@/lib/types/stage';
 import { useInteractiveIframePool } from '@/lib/store/interactive-iframe-pool';
-import { patchHtmlForIframe } from '@/lib/utils/iframe';
 import { visibleClientRect } from '@/lib/edit/visible-client-rect';
+
+// The mobile portal rotates with the classroom. Measure its untransformed layout
+// so the iframe and its placeholder undergo the same transform exactly once.
+function stageLayoutBox(element: HTMLElement, stage: HTMLElement) {
+  let left = 0;
+  let top = 0;
+  for (
+    let node: HTMLElement | null = element;
+    node && node !== stage;
+    node = node.offsetParent as HTMLElement | null
+  ) {
+    const parent = node.offsetParent as HTMLElement | null;
+    left += node.offsetLeft + (parent?.clientLeft ?? 0);
+    top += node.offsetTop + (parent?.clientTop ?? 0);
+  }
+  for (
+    let parent = element.parentElement;
+    element !== stage && parent && parent !== stage;
+    parent = parent.parentElement
+  ) {
+    left -= parent.scrollLeft;
+    top -= parent.scrollTop;
+  }
+  return { left, top, width: element.offsetWidth, height: element.offsetHeight };
+}
 
 interface InteractiveRendererProps {
   readonly content: InteractiveContent;
@@ -31,23 +55,18 @@ export function InteractiveRenderer({ content, sceneId }: InteractiveRendererPro
   const release = useInteractiveIframePool((s) => s.release);
   const setActive = useInteractiveIframePool((s) => s.setActive);
 
-  const patchedHtml = useMemo(
-    () => (content.html ? patchHtmlForIframe(content.html) : undefined),
-    [content.html],
-  );
-
   // Register / activate / claim visibility while mounted; release (keep-alive) on
   // unmount. A content change re-runs this and rebuilds the iframe — the only
   // intended reload path.
   useEffect(() => {
     mount(sceneId, {
-      srcDoc: patchedHtml,
-      src: patchedHtml ? undefined : content.url,
+      sourceHtml: content.html,
+      src: content.html ? undefined : content.url,
     });
     setActive(sceneId);
     claim(sceneId, owner);
     return () => release(sceneId, owner);
-  }, [sceneId, owner, patchedHtml, content.url, mount, setActive, claim, release]);
+  }, [sceneId, owner, content.html, content.url, mount, setActive, claim, release]);
 
   // Track this slot's screen rect for the host. rAF loop mirrors useTrackedRect:
   // one getBoundingClientRect read resolves canvas scale, viewport offset and
@@ -57,8 +76,16 @@ export function InteractiveRenderer({ content, sceneId }: InteractiveRendererPro
     const measure = () => {
       const node = slotRef.current;
       if (node) {
-        const r = node.getBoundingClientRect();
-        const clip = visibleClientRect(node);
+        const stage = node.closest<HTMLElement>('[data-classroom-stage][data-mobile="true"]');
+        const measure = stage
+          ? (element: Element) => stageLayoutBox(element as HTMLElement, stage)
+          : undefined;
+        const r = measure ? measure(node) : node.getBoundingClientRect();
+        const clip = visibleClientRect(
+          node,
+          measure,
+          stage ?? node.ownerDocument.fullscreenElement,
+        );
         setRect(sceneId, { left: r.left, top: r.top, width: r.width, height: r.height }, clip);
       }
       raf = requestAnimationFrame(measure);

@@ -1,0 +1,140 @@
+/**
+ * Scene actions: generate the playback actions (speech, spotlights, ...) for
+ * one scene from its outline and content, with the course context (the
+ * scene's place among all outlines and the speeches of the scenes before it),
+ * and assemble the complete scene. The logic of 1.1.x's
+ * POST /api/generate/scene-actions.
+ */
+import { prepareVisionImages } from '../vision-images';
+import { createGenerationAiCall } from '../ai-call';
+import {
+  generateSceneActions as generateActions,
+  buildCompleteScene,
+  type SceneGenerationContext,
+  type AgentInfo,
+} from '@openmaic/generation';
+import { isActionType } from '@openmaic/dsl';
+import type {
+  SceneOutline,
+  GeneratedSlideContent,
+  GeneratedQuizContent,
+  GeneratedInteractiveContent,
+  GeneratedPBLContent,
+} from '@/lib/types/generation';
+import type { SpeechAction } from '@/lib/types/action';
+import type { PBLContent } from '@/lib/types/stage';
+import { normalizeLegacyPBLContent } from '@/lib/pbl/legacy/read';
+
+import { StepRefusal, type StepContext, type StepLanguageModel } from './context';
+
+export interface SceneActionsInput {
+  outline: SceneOutline;
+  /** Every outline of the course, for the scene's page index and the titles around it. */
+  allOutlines: SceneOutline[];
+  content:
+    | GeneratedSlideContent
+    | GeneratedQuizContent
+    | GeneratedInteractiveContent
+    | GeneratedPBLContent
+    | PBLContent;
+  stageId: string;
+  agents?: AgentInfo[];
+  /** What the scenes before this one said, for continuity. */
+  previousSpeeches?: string[];
+  userProfile?: string;
+  languageDirective?: string;
+  /** The scene-actions stage's model. */
+  model: StepLanguageModel;
+}
+
+export type SceneActionsRefusal = 'assembly-failed';
+
+export type GeneratedScene = NonNullable<ReturnType<typeof buildCompleteScene>>;
+
+export interface SceneActionsResult {
+  scene: GeneratedScene;
+  /** This scene's speeches, for the scenes after it. */
+  previousSpeeches: string[];
+}
+
+export async function generateSceneActions(
+  input: SceneActionsInput,
+  ctx: StepContext,
+): Promise<SceneActionsResult> {
+  const { outline, allOutlines, content, stageId, agents, userProfile, languageDirective } = input;
+  const { modelString } = input.model;
+  const { log } = ctx;
+
+  const aiCall = createGenerationAiCall(input.model, 'scene-actions', {
+    abortSignal: ctx.signal,
+    resolveVisionImages: (images) => prepareVisionImages(images, log),
+  });
+
+  // ── Build cross-scene context ──
+  const allTitles = allOutlines.map((o) => o.title);
+  const pageIndex = allOutlines.findIndex((o) => o.id === outline.id);
+  const generationCtx: SceneGenerationContext = {
+    pageIndex: (pageIndex >= 0 ? pageIndex : 0) + 1,
+    totalPages: allOutlines.length,
+    allTitles,
+    previousSpeeches: input.previousSpeeches ?? [],
+  };
+
+  // ── Generate actions ──
+  log.info(`Generating actions: "${outline.title}" (${outline.type}) [model=${modelString}]`);
+
+  const generationContent = (
+    'type' in content && content.type === 'pbl' ? normalizeLegacyPBLContent(content) : content
+  ) as
+    | GeneratedSlideContent
+    | GeneratedQuizContent
+    | GeneratedInteractiveContent
+    | GeneratedPBLContent;
+
+  const actionOptions = {
+    ctx: generationCtx,
+    agents,
+    userProfile,
+    languageDirective,
+  };
+  const generated = await generateActions(outline, generationContent, aiCall, actionOptions);
+
+  // A model can invent an action type. The run's write boundary rejects a scene
+  // holding one and playback has no way to run it, so one invented action must
+  // not cost the whole scene: drop it and say so.
+  const known = generated.filter((action) => {
+    if (isActionType(action.type)) return true;
+    log.warn(`Dropping generated action with unknown type: ${JSON.stringify(action.type)}`);
+    return false;
+  });
+  // Nothing usable left is the same as an empty response, which the generator
+  // already answers with its default actions.
+  const actions =
+    generated.length > 0 && known.length === 0
+      ? await generateActions(outline, generationContent, async () => '[]', actionOptions)
+      : known;
+
+  log.info(`Generated ${actions.length} actions for: "${outline.title}"`);
+
+  // ── Build complete scene ──
+  const scene = buildCompleteScene(outline, generationContent, actions, stageId);
+
+  if (!scene) {
+    log.error(`Failed to build scene: "${outline.title}"`);
+    throw new StepRefusal<SceneActionsRefusal>(
+      'assembly-failed',
+      `Failed to build scene: ${outline.title}`,
+    );
+  }
+
+  // ── Extract speeches for cross-scene coherence ──
+  const previousSpeeches = (scene.actions || [])
+    .filter((a): a is SpeechAction => a.type === 'speech')
+    .map((a) => a.text);
+
+  log.info(
+    `Scene assembled successfully: "${outline.title}" — ${scene.actions?.length ?? 0} actions`,
+  );
+
+  return { scene, previousSpeeches };
+}

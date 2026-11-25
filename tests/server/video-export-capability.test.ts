@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const { proxyFetch } = vi.hoisted(() => ({ proxyFetch: vi.fn() }));
 vi.mock('@/lib/server/proxy-fetch', () => ({ proxyFetch }));
 import { GET } from '@/app/api/export-video/capability/route';
+import { getRenderServiceCapability } from '@/lib/server/render-service';
 
 beforeEach(() => {
   vi.stubEnv('RENDER_SERVICE_URL', 'http://render-service:9000/');
@@ -10,12 +11,40 @@ beforeEach(() => {
 });
 afterEach(() => vi.unstubAllEnvs());
 
+function ownerBound(response: Response): Response {
+  response.headers.set('x-openmaic-render-owner-bound', '1');
+  return response;
+}
+
 describe('video export capability', () => {
+  it.each([undefined, 'true', true])(
+    'requires explicit hosted library support from health (%s)',
+    async (interactiveRuntimeHostedLibraries) => {
+      proxyFetch.mockResolvedValue(
+        ownerBound(
+          Response.json({ interactiveRuntimeCheck: true, interactiveRuntimeHostedLibraries }),
+        ),
+      );
+      const capability = await getRenderServiceCapability();
+      expect(capability.interactiveRuntimeCheck).toBe(true);
+      expect(capability.interactiveRuntimeHostedLibraries).toBe(
+        interactiveRuntimeHostedLibraries === true ? true : undefined,
+      );
+    },
+  );
+
   it.each([true, false])(
     'forwards accepting=%s without leaking service details',
     async (accepting) => {
       proxyFetch.mockResolvedValue(
-        Response.json({ ok: true, accepting, versions: { internal: 'x' } }),
+        ownerBound(
+          Response.json({
+            ok: true,
+            accepting,
+            interactiveRuntimeCheck: true,
+            versions: { internal: 'x' },
+          }),
+        ),
       );
       expect(await (await GET()).json()).toEqual({ success: true, enabled: true, accepting });
       expect(proxyFetch).toHaveBeenCalledWith('http://render-service:9000/health', {
@@ -26,15 +55,15 @@ describe('video export capability', () => {
   );
 
   it.each([{ ok: true }, { accepting: 'false' }, null])(
-    'supports older health responses: %j',
+    'disables an older service without the owner-binding marker: %j',
     async (body) => {
       proxyFetch.mockResolvedValue(Response.json(body));
-      expect(await (await GET()).json()).toEqual({ success: true, enabled: true });
+      expect(await (await GET()).json()).toEqual({ success: true, enabled: false });
     },
   );
 
-  it('keeps a healthy service enabled when its body is not JSON', async () => {
-    proxyFetch.mockResolvedValue(new Response('OK'));
+  it('keeps a marked healthy service enabled when its body is not JSON', async () => {
+    proxyFetch.mockResolvedValue(ownerBound(new Response('OK')));
     expect(await (await GET()).json()).toEqual({ success: true, enabled: true });
   });
 

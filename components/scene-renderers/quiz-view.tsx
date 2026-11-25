@@ -1,5 +1,6 @@
 'use client';
 
+import { emitQuizReviewed } from '@/lib/classroom/quiz-reviewed';
 import { memo, useState, useMemo, useCallback, useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { answerIncludesOption } from '@/lib/quiz/grading';
@@ -16,7 +17,6 @@ import {
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useI18n } from '@/lib/hooks/use-i18n';
-import { getCurrentModelConfig } from '@/lib/utils/model-config';
 import { createLogger } from '@/lib/logger';
 
 const log = createLogger('QuizView');
@@ -98,14 +98,8 @@ async function gradeShortAnswerQuestion(
 ): Promise<QuestionResult> {
   const pts = q.points ?? 1;
   try {
-    const modelConfig = getCurrentModelConfig();
-    const headers: Record<string, string> = {
-      'Content-Type': 'application/json',
-      'x-model': modelConfig.modelString,
-      'x-api-key': modelConfig.apiKey,
-    };
-    if (modelConfig.baseUrl) headers['x-base-url'] = modelConfig.baseUrl;
-    if (modelConfig.providerType) headers['x-provider-type'] = modelConfig.providerType;
+    // The server grades with the workspace's classroom model.
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
 
     const res = await fetch('/api/quiz-grade', {
       method: 'POST',
@@ -837,6 +831,7 @@ export function QuizView({ questions, sceneId, stageId }: QuizViewProps) {
       if (cancelled) return;
       setResults(ordered);
       setPhase('reviewing');
+      emitQuizReviewed(sceneId);
     })();
 
     return () => {

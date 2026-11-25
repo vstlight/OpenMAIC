@@ -1,8 +1,11 @@
 'use client';
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef } from 'react';
 import { useSettingsStore } from '@/lib/store/settings';
+import { useTTSSelection } from '@/lib/audio/use-tts-selection';
+import { slotTTSProvidersConfig } from '@/lib/audio/tts-selection';
 import { useBrowserTTS } from '@/lib/hooks/use-browser-tts';
+import { useBrowserVoices } from '@/lib/audio/use-browser-voices';
 import {
   resolveAgentVoice,
   resolveNarratorVoiceBinding,
@@ -10,6 +13,10 @@ import {
   type ResolvedVoice,
 } from '@/lib/audio/voice-resolver';
 import { isTTSProviderEnabled } from '@/lib/audio/provider-enablement';
+import {
+  getDiscussionAudioElement,
+  releaseDiscussionAudioLine,
+} from '@/lib/audio/discussion-audio';
 import { useAllVoiceProfiles } from '@/lib/audio/voxcpm-voices';
 import { resolveAgentVoiceOptions } from '@/lib/audio/agent-voice';
 import type { AgentConfig } from '@/lib/orchestration/registry/types';
@@ -23,6 +30,7 @@ import {
   markVoiceBindingNoticeShown,
   markVoiceBindingUnavailable,
   trackAssignedVoiceBinding,
+  voiceBindingKey,
 } from '@/lib/audio/unavailable-voice-bindings';
 
 interface DiscussionTTSOptions {
@@ -51,16 +59,23 @@ interface PreparedSegment {
 
 export function useDiscussionTTS({ enabled, agents, onAudioStateChange }: DiscussionTTSOptions) {
   const { locale, t } = useI18n();
-  const ttsProvidersConfig = useSettingsStore((s) => s.ttsProvidersConfig);
+  // The tts slot's provider (the only one the server synthesizes with) and
+  // the user's voice for it.
+  const ttsSelectionValue = useTTSSelection();
+  const ttsProvidersConfig = useMemo(
+    () => ttsSelectionValue?.providersConfig ?? slotTTSProvidersConfig(null),
+    [ttsSelectionValue],
+  );
   const ttsSpeed = useSettingsStore((s) => s.ttsSpeed);
   const ttsMuted = useSettingsStore((s) => s.ttsMuted);
   const ttsVolume = useSettingsStore((s) => s.ttsVolume);
   const playbackSpeed = useSettingsStore((s) => s.playbackSpeed);
-  const playbackSettingsRef = useRef({ playbackSpeed, ttsMuted, ttsVolume });
-  playbackSettingsRef.current = { playbackSpeed, ttsMuted, ttsVolume };
+  const playbackSettingsRef = useRef({ playbackSpeed, ttsMuted, ttsVolume, ttsSpeed, locale });
+  playbackSettingsRef.current = { playbackSpeed, ttsMuted, ttsVolume, ttsSpeed, locale };
   // Global lecture voice — used as fallback for teacher agent
-  const globalTtsProviderId = useSettingsStore((s) => s.ttsProviderId);
-  const globalTtsVoice = useSettingsStore((s) => s.ttsVoice);
+  const globalTtsProviderId = (ttsSelectionValue?.providerId ??
+    'browser-native-tts') as TTSProviderId;
+  const globalTtsVoice = ttsSelectionValue?.voice ?? 'default';
   const agentVoiceOverrides = useSettingsStore((s) => s.agentVoiceOverrides);
   const { profiles: voiceProfiles } = useAllVoiceProfiles();
 
@@ -76,10 +91,31 @@ export function useDiscussionTTS({ enabled, agents, onAudioStateChange }: Discus
   const segmentDoneCounterRef = useRef(0);
   const abortControllerRef = useRef<AbortController | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  /**
+   * Identifies the line that currently owns the reused element. Element identity
+   * can no longer tell lines apart (there is one element), so a stale `ended` /
+   * `error` / rejected-play path from an earlier line must be recognised by its
+   * token instead of by which element it came from.
+   */
+  const playbackTokenRef = useRef(0);
   const onAudioStateChangeRef = useRef(onAudioStateChange);
   onAudioStateChangeRef.current = onAudioStateChange;
   const processQueueRef = useRef<() => void>(() => {});
   const agentBindingKeysRef = useRef(new Map<string, string>());
+
+  /** The browser line is over: spoken to the end, or never started. */
+  const finishBrowserLine = useCallback(() => {
+    if (currentProviderRef.current !== 'browser-native-tts' || !isPlayingRef.current) return;
+    currentItemRef.current = null;
+    currentProviderRef.current = null;
+    isPlayingRef.current = false;
+    segmentDoneCounterRef.current++;
+    onAudioStateChangeRef.current?.(null, 'idle');
+    // Don't advance queue while paused — resume() will kick-start it
+    if (!pausedRef.current) {
+      processQueueRef.current();
+    }
+  }, []);
 
   const {
     speak: browserSpeak,
@@ -87,19 +123,19 @@ export function useDiscussionTTS({ enabled, agents, onAudioStateChange }: Discus
     resume: browserResume,
     cancel: browserCancel,
   } = useBrowserTTS({
-    rate: ttsSpeed,
-    onEnd: () => {
-      if (currentProviderRef.current !== 'browser-native-tts' || !isPlayingRef.current) return;
-      currentItemRef.current = null;
-      currentProviderRef.current = null;
-      isPlayingRef.current = false;
-      segmentDoneCounterRef.current++;
-      onAudioStateChangeRef.current?.(null, 'idle');
-      // Don't advance queue while paused — resume() will kick-start it
-      if (!pausedRef.current) {
-        processQueueRef.current();
-      }
+    // Same speed, volume and mute as server audio in the discussion and as
+    // browser speech in the lecture; read per sentence, so a change applies
+    // from the next sentence.
+    getSettings: () => {
+      const settings = playbackSettingsRef.current;
+      return {
+        locale: settings.locale,
+        rate: settings.ttsSpeed * settings.playbackSpeed,
+        volume: settings.ttsVolume,
+        muted: settings.ttsMuted,
+      };
     },
+    onEnd: finishBrowserLine,
   });
   const browserCancelRef = useRef(browserCancel);
   browserCancelRef.current = browserCancel;
@@ -120,14 +156,7 @@ export function useDiscussionTTS({ enabled, agents, onAudioStateChange }: Discus
 
   // Browser-native voices (dynamic, client-only) — same source the AgentBar
   // picker uses, so discussion resolution and the picker stay in sync.
-  const [browserVoices, setBrowserVoices] = useState<SpeechSynthesisVoice[]>([]);
-  useEffect(() => {
-    if (typeof window === 'undefined' || !window.speechSynthesis) return;
-    const load = () => setBrowserVoices(window.speechSynthesis.getVoices());
-    load();
-    window.speechSynthesis.addEventListener('voiceschanged', load);
-    return () => window.speechSynthesis.removeEventListener('voiceschanged', load);
-  }, []);
+  const browserVoices = useBrowserVoices();
 
   const resolveVoiceForAgent = useCallback(
     (agentId: string | null): ResolvedVoice | null => {
@@ -162,7 +191,7 @@ export function useDiscussionTTS({ enabled, agents, onAudioStateChange }: Discus
       );
       // Teacher's voice = the global lecture selection, honored VERBATIM (incl.
       // its model) whenever that provider is enabled — identical to what the
-      // pre-generated lecture sends (use-scene-generator), so lecture and
+      // lecture narration sends (lib/audio/narration-tts), so lecture and
       // discussion teacher never diverge. No voiceId re-validation/fallback that
       // could swap the user's chosen voice. Only if the global provider is itself
       // disabled does the teacher fall back to an enabled provider.
@@ -234,17 +263,12 @@ export function useDiscussionTTS({ enabled, agents, onAudioStateChange }: Discus
       const res = await fetch('/api/generate/tts', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        // The tts slot names the provider and model on the server.
         body: JSON.stringify({
           text: item.text,
           audioId: item.partId,
-          ttsProviderId: item.providerId,
-          ttsModelId: item.modelId || providerConfig?.modelId,
           ttsVoice: item.voiceId,
           ttsSpeed: ttsSpeed,
-          ttsApiKey: providerConfig?.apiKey,
-          // Managed providers resolve their base URL server-side; only send the
-          // client's own base URL (custom providers).
-          ttsBaseUrl: providerConfig?.baseUrl || providerConfig?.customDefaultBaseUrl,
           ttsProviderOptions: providerOptions,
         }),
         signal: controller.signal,
@@ -301,7 +325,10 @@ export function useDiscussionTTS({ enabled, agents, onAudioStateChange }: Discus
     if (item.providerId === 'browser-native-tts') {
       currentProviderRef.current = item.providerId;
       onAudioStateChangeRef.current?.(item.agentId, 'playing');
-      browserSpeakRef.current(item.text, item.voiceId);
+      void browserSpeakRef.current(item.text, item.voiceId).then((started) => {
+        // Nothing will be spoken (e.g. no speech support): the line is over.
+        if (!started && currentItemRef.current === item) finishBrowserLine();
+      });
       prefetchNextRef.current();
       return;
     }
@@ -326,21 +353,24 @@ export function useDiscussionTTS({ enabled, agents, onAudioStateChange }: Discus
       if ('error' in result) throw result.error;
       abortControllerRef.current = null;
       const audioUrl = result.audioUrl;
-      const audio = new Audio(audioUrl);
+      // Reuse this playback module's element rather than creating one per line:
+      // a fresh element's programmatic play() is what mobile autoplay policies
+      // refuse, which left the discussion silent from the second line on.
+      const audio = getDiscussionAudioElement();
+      const token = ++playbackTokenRef.current;
+      audio.src = audioUrl;
       const settings = playbackSettingsRef.current;
+      audio.defaultPlaybackRate = settings.playbackSpeed;
       audio.playbackRate = settings.playbackSpeed;
       audio.volume = settings.ttsMuted ? 0 : settings.ttsVolume;
       audioRef.current = audio;
       const finish = () => {
-        if (audioRef.current !== audio) return;
+        if (token !== playbackTokenRef.current) return;
         audioRef.current = null;
         finishAudioRef.current = null;
         currentItemRef.current = null;
         currentProviderRef.current = null;
-        audio.removeEventListener('ended', finish);
-        audio.removeEventListener('error', finish);
-        audio.pause();
-        audio.src = '';
+        releaseDiscussionAudioLine(audio);
         isPlayingRef.current = false;
         segmentDoneCounterRef.current++;
         onAudioStateChangeRef.current?.(item.agentId, 'idle');
@@ -349,8 +379,11 @@ export function useDiscussionTTS({ enabled, agents, onAudioStateChange }: Discus
         }
       };
       finishAudioRef.current = finish;
-      audio.addEventListener('ended', finish);
-      audio.addEventListener('error', finish);
+      // Assignment rather than addEventListener: the element is reused, so a
+      // listener would otherwise accumulate once per line and fire this callback
+      // several times for one line.
+      audio.onended = finish;
+      audio.onerror = finish;
 
       // If paused during TTS generation, keep audio ready but don't play
       if (pausedRef.current) {
@@ -361,7 +394,8 @@ export function useDiscussionTTS({ enabled, agents, onAudioStateChange }: Discus
 
       onAudioStateChangeRef.current?.(item.agentId, 'playing');
       await audio.play();
-      if (audioRef.current === audio) prefetchNextRef.current();
+      // Identity no longer distinguishes lines (one element), so the token does.
+      if (token === playbackTokenRef.current) prefetchNextRef.current();
     } catch (err) {
       if (controller.signal.aborted || currentItemRef.current !== item) return;
       if (finishAudioRef.current) {
@@ -369,6 +403,12 @@ export function useDiscussionTTS({ enabled, agents, onAudioStateChange }: Discus
         return;
       }
       abortControllerRef.current = null;
+      if (
+        (err as { errorCode?: unknown })?.errorCode === 'QWEN_VC_RECLONE_REQUIRED' &&
+        markVoiceBindingNoticeShown(voiceBindingKey(item))
+      ) {
+        toast.warning(t('settings.qwenCloneMigrationHint'));
+      }
       const cloneUnavailable =
         err &&
         typeof err === 'object' &&
@@ -405,7 +445,7 @@ export function useDiscussionTTS({ enabled, agents, onAudioStateChange }: Discus
         queueMicrotask(() => processQueueRef.current());
       }
     }
-  }, [enabled, t, ttsMuted, generateAudio]);
+  }, [enabled, t, ttsMuted, generateAudio, finishBrowserLine]);
 
   processQueueRef.current = processQueue;
 
@@ -421,9 +461,12 @@ export function useDiscussionTTS({ enabled, agents, onAudioStateChange }: Discus
         providerId,
         voiceId,
         modelId ?? ttsProvidersConfig[providerId]?.modelId,
+        ttsProvidersConfig[providerId]?.voices,
       );
       const fallbackVoice =
-        agentId && providerId === 'qwen-tts' && isQwenCloneVoice(voiceId)
+        agentId &&
+        providerId === 'qwen-tts' &&
+        isQwenCloneVoice(voiceId, ttsProvidersConfig[providerId]?.voices)
           ? resolveNarratorVoiceBinding(
               undefined,
               {
@@ -473,11 +516,13 @@ export function useDiscussionTTS({ enabled, agents, onAudioStateChange }: Discus
     prefetchedRef.current = null;
     abortControllerRef.current?.abort();
     abortControllerRef.current = null;
+    // The element outlives this line now, so the line's handlers have to go with
+    // it: a leftover handler would let a late event finish the *next* line.
+    playbackTokenRef.current++;
     if (audioRef.current) {
       const audio = audioRef.current;
       audioRef.current = null;
-      audio.pause();
-      audio.src = '';
+      releaseDiscussionAudioLine(audio);
     }
     browserCancelRef.current();
     queueRef.current = [];
@@ -505,9 +550,11 @@ export function useDiscussionTTS({ enabled, agents, onAudioStateChange }: Discus
       browserResumeRef.current();
     } else if (audioRef.current && audioRef.current.paused) {
       const audio = audioRef.current;
-      void audio.play().catch(() => {
-        if (audioRef.current === audio) finishAudioRef.current?.();
-      });
+      // Take this line's own finish closure: it carries the line's token, so a
+      // rejection that arrives after another line took the element cannot finish
+      // the line that is playing now.
+      const lineFinish = finishAudioRef.current;
+      void audio.play().catch(() => lineFinish?.());
     } else if (!isPlayingRef.current) {
       // Audio finished while paused — kick-start the queue
       processQueueRef.current();
@@ -518,6 +565,7 @@ export function useDiscussionTTS({ enabled, agents, onAudioStateChange }: Discus
   // Sync playbackSpeed to currently playing audio in real-time
   useEffect(() => {
     if (audioRef.current) {
+      audioRef.current.defaultPlaybackRate = playbackSpeed;
       audioRef.current.playbackRate = playbackSpeed;
     }
   }, [playbackSpeed]);

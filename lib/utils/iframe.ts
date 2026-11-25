@@ -1,5 +1,12 @@
+import { mediaBridgeScript } from '@/lib/interactive/media-bridge';
+import { postProcessInteractiveHtml } from '@openmaic/generation/browser';
 import { injectIntoDocumentHead } from './html-document';
+import {
+  withObservationResponder,
+  type ObservationIdentity,
+} from '@/lib/interactive/observation-bridge';
 import { INTERACTIVE_REFERENCE_EXCLUDED_TAG_NAMES } from '@/lib/interactive/element-reference-policy';
+import { CONTENT_FIT_BASE_CSS, CONTENT_FIT_SHIM } from '@/lib/interactive/content-fit-shim';
 
 const INTERACTIVE_REFERENCE_EXCLUDED_TAG_LOOKUP = Object.fromEntries(
   INTERACTIVE_REFERENCE_EXCLUDED_TAG_NAMES.map((tagName) => [tagName, 1]),
@@ -47,17 +54,16 @@ const STORAGE_SHIM = `<script data-iframe-storage-shim>
  * reference to a CDN lib that failed to load, …) → the script aborts and the
  * widget renders blank. The sandboxed (null-origin) iframe can't be read by the
  * editor, but it CAN `postMessage` out: this forwards `window.onerror`, unhandled
- * rejections and `console.error` to the parent, which stores them per scene and
- * feeds them to the editor agent — so it can diagnose a blank page instead of
- * guessing. Only touches `window.*` so it stays sandbox-safe and unit-testable.
+ * rejections and `console.error` to the parent for diagnostic consumers such
+ * as video export.
  *
- * The most important errors (a `JSON.parse` that aborts setup) fire SYNCHRONOUSLY
- * while srcDoc parses — potentially before the parent has subscribed its `message`
- * listener (which it installs from a passive effect after inserting the iframe).
- * To avoid losing exactly the errors this feature exists to surface, every post is
- * also buffered, and the shim re-emits the whole buffer when the parent sends a
- * `{ __maicErrorReplayRequest: true }` message once its listener is ready. The
- * parent dedups, so the live + replayed copies collapse to one.
+ * Errors can fire synchronously while srcDoc parses, before a parent's message
+ * listener is ready. The shim buffers each report and replays the buffer when
+ * it receives `{ __maicErrorReplayRequest: true }`. Consumers can receive both
+ * the live report and its replay.
+ *
+ * Known-benign browser notices such as the ResizeObserver loop notice are
+ * filtered out.
  */
 const ERROR_CAPTURE_SHIM = `<script data-iframe-error-shim>
 (function () {
@@ -70,8 +76,12 @@ const ERROR_CAPTURE_SHIM = `<script data-iframe-error-shim>
       );
     } catch (e) {}
   }
+  // Chromium's ResizeObserver loop notice: delivered through window.onerror,
+  // but nothing threw and the page keeps working, so it is not a runtime error.
+  var BENIGN = /ResizeObserver loop (completed with undelivered notifications|limit exceeded)/;
   function post(errorKind, message) {
     message = String(message).slice(0, 1200);
+    if (BENIGN.test(message)) return;
     if (buffer.length < 50) buffer.push([errorKind, message]);
     emit(errorKind, message);
   }
@@ -376,7 +386,19 @@ const ELEMENT_PICKER_SHIM = `<script data-iframe-element-picker-shim>
  * placed first so they run before the page's own scripts (error capture first, so
  * it also observes the storage shim).
  */
-export function patchHtmlForIframe(html: string): string {
+/**
+ * Identity for the observation reader shim. Supplied by the caller and never
+ * generated here: it is serialized into the returned document, so a value that
+ * changed per call would churn the iframe `srcDoc` and break pooling keep-alive.
+ * Omitted by consumers that produce standalone documents (video export), where
+ * no parent ever asks and the bytes count against an export size cap.
+ */
+export function patchHtmlForIframe(
+  html: string,
+  observation?: ObservationIdentity,
+  options?: { processed?: boolean; mediaId?: string },
+): string {
+  if (!options?.processed) html = postProcessInteractiveHtml(html);
   const iframeCss = `<style data-iframe-patch>
   html, body {
     width: 100%;
@@ -389,10 +411,25 @@ export function patchHtmlForIframe(html: string): string {
   /* Fix min-h-screen: in iframes 100vh is the iframe height, which is correct,
      but ensure body actually fills it */
   body { min-height: 100vh; }
+  /* Zero-specificity media defaults; authored rules still win. */
+  ${CONTENT_FIT_BASE_CSS}
 </style>`;
 
   const injection =
-    '\n' + ERROR_CAPTURE_SHIM + '\n' + ELEMENT_PICKER_SHIM + '\n' + STORAGE_SHIM + '\n' + iframeCss;
+    '\n' +
+    ERROR_CAPTURE_SHIM +
+    '\n' +
+    ELEMENT_PICKER_SHIM +
+    '\n' +
+    CONTENT_FIT_SHIM +
+    '\n' +
+    STORAGE_SHIM +
+    '\n' +
+    (options?.mediaId ? mediaBridgeScript(options.mediaId) : '') +
+    '\n' +
+    iframeCss;
 
-  return injectIntoDocumentHead(html, injection);
+  const patched = injectIntoDocumentHead(html, injection);
+  // Body end, not head: the reader captures the scope element as it installs.
+  return observation ? withObservationResponder(patched, observation) : patched;
 }

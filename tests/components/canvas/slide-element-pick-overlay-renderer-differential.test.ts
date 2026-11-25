@@ -51,11 +51,44 @@ const scene = {
   content,
 } as Extract<Scene, { type: 'slide' }>;
 
+const brokenShapeContent: SlideContent = {
+  ...content,
+  canvas: {
+    ...content.canvas,
+    elements: [
+      {
+        id: 'shape-1',
+        type: 'shape',
+        left: 24,
+        top: 32,
+        width: 120,
+        height: 48,
+        rotate: 0,
+        viewBox: [120, 48],
+        path: 'M0 0 Z1 1',
+        fixedRatio: false,
+        fill: '#ffffff',
+        text: {
+          content: '<p>Recovered label</p>',
+          defaultFontName: 'Arial',
+          defaultColor: '#111111',
+          align: 'middle',
+        },
+      },
+    ],
+  },
+};
+const brokenShapeScene = { ...scene, content: brokenShapeContent };
+
 const controller: SceneDataController<SlideContent> = {
   sceneId: scene.id,
   sceneType: 'slide',
   getSnapshot: () => content,
   updateSceneData: () => {},
+};
+const brokenShapeController: SceneDataController<SlideContent> = {
+  ...controller,
+  getSnapshot: () => brokenShapeContent,
 };
 
 const TestSceneProvider = SceneProvider as ComponentType<{
@@ -84,7 +117,7 @@ class TestResizeObserver {
 }
 
 describe.each([
-  ['Legacy', undefined],
+  ['Legacy', 'false'],
   ['New', 'true'],
 ] as const)('SlideElementPickOverlay with the real %s playback renderer', (_name, flag) => {
   const rendererFlag = 'NEXT_PUBLIC_MAIC_PLAYBACK_RENDERER_ENABLED';
@@ -95,8 +128,7 @@ describe.each([
 
   beforeEach(() => {
     originalFlag = process.env[rendererFlag];
-    if (flag === undefined) delete process.env[rendererFlag];
-    else process.env[rendererFlag] = flag;
+    process.env[rendererFlag] = flag;
     vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
     vi.stubGlobal('ResizeObserver', TestResizeObserver);
     frames = [];
@@ -113,6 +145,7 @@ describe.each([
     ) {
       if (this.dataset.testid === 'slide-element-pick-overlay') return rect(0, 0, 800, 450);
       if (this.classList.contains('base-element-text')) return rect(80, 60, 120, 48);
+      if (this.hasAttribute('data-shape-geometry-error')) return rect(0, 0, 0, 0);
       if (this.classList.contains('slide-element')) return rect(0, 0, 800, 450);
       if (this.classList.contains('screen-element')) return rect(0, 0, 0, 0);
       return rect(0, 0, 800, 450);
@@ -156,7 +189,7 @@ describe.each([
     const initialFrames = frames.splice(0);
     act(() => initialFrames.forEach((callback) => callback(0)));
 
-    if (flag) {
+    if (flag === 'true') {
       expect(
         container.querySelector('.slide-element-hit-target .base-element-text'),
       ).not.toBeNull();
@@ -185,5 +218,35 @@ describe.each([
 
     expect(onPick).toHaveBeenCalledWith(expect.objectContaining({ id: 'text-1' }));
     expect(document.elementsFromPoint).not.toHaveBeenCalled();
+  });
+
+  it('outlines a malformed shape at its recovered text box', () => {
+    act(() => {
+      root.render(
+        createElement(
+          TestSceneProvider,
+          { controller: brokenShapeController },
+          createElement(
+            'div',
+            null,
+            createElement(PlaybackScreenCanvas),
+            createElement(SlideElementPickOverlay, {
+              scene: brokenShapeScene,
+              onPick: vi.fn(),
+              onCancel: vi.fn(),
+            }),
+          ),
+        ),
+      );
+    });
+    const initialFrames = frames.splice(0);
+    act(() => initialFrames.forEach((callback) => callback(0)));
+
+    expect(
+      container.querySelector('[data-shape-geometry-error] .base-element-text'),
+    ).not.toBeNull();
+    const outline = container.querySelector('.border-violet-400\\/70') as HTMLElement;
+    expect(outline.style.cssText).toContain('left: 80px');
+    expect(outline.style.cssText).toContain('width: 120px');
   });
 });

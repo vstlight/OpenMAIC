@@ -92,6 +92,8 @@ window.addEventListener('message', function(event) {
       // Reveal a hidden element
       const revealEl = document.querySelector(target);
       if (revealEl) {
+        revealEl.removeAttribute('hidden'); // Works for HTML and SVG elements
+        revealEl.classList.remove('hidden');
         revealEl.style.display = '';
         revealEl.style.opacity = '1';
       }
@@ -121,20 +123,32 @@ To make highlight/annotation work, use consistent IDs for controls:
   - **Bottom sheet**: Control panel slides up from bottom on mobile
   - **Side drawer**: Collapsible panel that doesn't block canvas
 - Test viewport widths: 320px, 375px, 414px, 768px
-- Use \`min-height\` for canvas to ensure it's visible on mobile
+- Give the canvas stage a bounded height so it stays visible on mobile
 - Control panel should be collapsible on mobile if large
 
 Example mobile-safe layout:
 \`\`\`html
+<style>
+  [hidden]:not([hidden="until-found"]) { display: none !important; }
+  /* The stage's size never depends on the canvas, which sits out of flow inside it:
+     a bounded height when stacked, the full row height side by side. */
+  #stage { position: relative; flex: 1 1 auto; min-width: 0; height: clamp(260px, 60vh, 640px); }
+  @media (min-width: 768px) { #stage { height: auto; align-self: stretch; } }
+  #canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+  #canvas-error { position: absolute; inset: 0; display: grid; place-items: center; }
+</style>
 <body class="flex flex-col min-h-screen md:flex-row">
   <!-- Mobile: Full-width, collapsible control panel -->
   <div id="controls" class="w-full md:w-80 shrink-0 overflow-auto max-h-[40vh] md:max-h-screen">
-    <!-- Controls here -->
-    <button onclick="toggleControls()" class="md:hidden">Hide Controls</button>
+    <!-- Sliders for the lesson's variables -->
+    <button id="start-btn" onclick="handleMainButton()"></button>
+    <button id="reset-btn" onclick="resetSimulation()"><!-- Reset label, in the course language --></button>
+    <!-- Readouts: one element per quantity the lesson tracks, id="{variable_name}-display" -->
+    <button onclick="toggleControls()" class="md:hidden"><!-- Hide label, in the course language --></button>
   </div>
-  <!-- Canvas area gets remaining space -->
-  <div class="flex-1 min-h-[300px] relative">
+  <div id="stage">
     <canvas id="canvas"></canvas>
+    <div id="canvas-error" hidden><!-- Error message, in the course language --></div>
   </div>
 </body>
 \`\`\`
@@ -142,11 +156,37 @@ Example mobile-safe layout:
 ### 2. Reset Button - MUST WORK CORRECTLY
 - **Reset button MUST return simulation to initial state**
 - Common bug: Button changes text to "重新开始" but clicking it doesn't reset
-- Solution: Use a separate reset function, or check state properly
+- Common bug: Reset restores the state but the readouts keep showing the previous run
+- Solution: Use a separate reset function that rebuilds the state, then calls the same \`render()\` as startup and every update
 
 Correct implementation:
 \`\`\`javascript
-let state = { running: false, ended: false, posX: 50, velocity: 0 };
+// The lesson supplies these; they are placeholders here, not part of the pattern:
+//   initialQuantities()  the lesson's own quantities at their starting values
+//   advance(state, dt)   moves those quantities forward by dt seconds
+//   isFinished(state)    whether the run has reached its end
+//   renderReadouts()     writes every readout from state
+//   LABELS               the main button's text in the course language: { start, pause, resume, restart }
+function initialState() {
+  return { running: false, paused: false, ended: false, ...initialQuantities() };
+}
+let state = initialState();
+let frameId = null;
+let lastFrameTime = null;
+
+function buttonLabel() {
+  if (state.ended) return LABELS.restart;
+  if (state.running) return LABELS.pause;
+  return state.paused ? LABELS.resume : LABELS.start;
+}
+
+// The one path from state to screen: every readout, the button text and the drawing.
+function render() {
+  renderReadouts();
+  document.getElementById('start-btn').textContent = buttonLabel();
+  draw();
+  publishCurrentState();
+}
 
 function handleMainButton() {
   if (state.ended) {
@@ -155,29 +195,53 @@ function handleMainButton() {
   } else if (state.running) {
     pauseSimulation();
   } else {
-    startSimulation();
+    startSimulation(); // Starts, or resumes after a pause
   }
 }
 
-function resetSimulation() {
+function startSimulation() {
+  state.running = true;
+  state.paused = false;
+  lastFrameTime = null;
+  render();
+  frameId = requestAnimationFrame(step);
+}
+
+function pauseSimulation() {
   state.running = false;
-  state.ended = false;
-  state.posX = 50;  // Reset to initial position!
-  state.velocity = 0;  // Reset velocity!
-  updateButton('启动');
-  draw();
+  state.paused = true;
+  cancelAnimationFrame(frameId);
+  render();
+}
+
+// Advance by the real time since the last frame, so the speed does not depend
+// on the display's refresh rate.
+function step(now) {
+  const dt = lastFrameTime === null ? 0 : Math.min((now - lastFrameTime) / 1000, 0.05);
+  lastFrameTime = now;
+  advance(state, dt);
+  if (isFinished(state)) {
+    onSimulationEnd();
+    return;
+  }
+  render();
+  frameId = requestAnimationFrame(step);
+}
+
+function resetSimulation() {
+  cancelAnimationFrame(frameId); // Stop the loop first
+  state = initialState();        // The same initial values as startup
+  render();                      // Readouts, button and drawing all follow the state
 }
 
 // When simulation hits boundary/ends:
 function onSimulationEnd() {
   state.running = false;
   state.ended = true;
-  updateButton('重新开始');
+  render();
 }
 
-function updateButton(text) {
-  document.getElementById('mainBtn').innerText = text;
-}
+// The initial render() runs once at startup, after the canvas setup below.
 \`\`\`
 
 ### 3. Button State Management
@@ -196,10 +260,43 @@ function updateButton(text) {
 - Use \`touch-action: none\` on canvas for custom gesture handling
 
 ### 5. Canvas Sizing
-- Use \`ResizeObserver\` or window resize event
-- Canvas should fill available space but respect \`max-height\`
+- Measure the stage, never the canvas: the stage's size must not depend on the canvas (see the layout example)
+- Apply \`devicePixelRatio\` once, and assign the bitmap size only when it changed
+- Draw and position everything in the stage's CSS size, never in \`canvas.width\` / \`canvas.height\` (device pixels)
+- Never write a measured size back to \`canvas.style\` or to the stage
 - Don't use fixed pixel dimensions
 - Account for control panel height on mobile
+
+\`\`\`javascript
+const stage = document.getElementById('stage');
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+
+function resizeCanvas() {
+  const dpr = window.devicePixelRatio || 1;
+  const width = Math.round(stage.clientWidth * dpr);
+  const height = Math.round(stage.clientHeight * dpr);
+  if (canvas.width === width && canvas.height === height) return;
+  canvas.width = width; // Resizing the bitmap clears it and resets the transform
+  canvas.height = height;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0); // Draw in CSS pixels
+  draw();
+}
+
+function draw() {
+  if (!ctx) return;
+  ctx.clearRect(0, 0, stage.clientWidth, stage.clientHeight);
+  // Draw the current state here, in CSS pixels.
+}
+
+if (ctx) {
+  new ResizeObserver(resizeCanvas).observe(stage); // Observing also runs the first resize
+} else {
+  document.getElementById('canvas-error').removeAttribute('hidden'); // The only path that shows it
+}
+
+render(); // Initial state, before any user action
+\`\`\`
 
 ### 6. Visual Feedback
 - Clear indication when simulation starts/pauses/ends
@@ -262,7 +359,7 @@ function updateButton(text) {
 
 ### 10. Accessibility
 - ARIA labels on all controls
-- Keyboard support (Space to start/pause, R to reset)
+- Keyboard support (Space to start/pause, R to reset), ignored while focus is in an input, textarea, select or editable element
 - Focus indicators
 - High contrast text on canvas
 
@@ -277,6 +374,9 @@ function updateButton(text) {
 | Bug | Cause | Solution |
 |-----|-------|----------|
 | Reset doesn't work | Button calls wrong function | Ensure reset function resets ALL state variables |
+| Readouts show the previous run after reset | Reset changes state without rendering | Rebuild the state, then call the one \`render()\` |
+| Error message covers a working canvas | \`display: grid\` on the layer overrides \`hidden\` | Add the \`[hidden]\` rule; show the layer only on a detected failure |
+| Canvas keeps growing until it is blank | Canvas in the flow of the stage it measures | Bounded stage, absolutely positioned canvas, bitmap size from the stage only |
 | Canvas overlap on mobile | Fixed positioning | Use flex/grid with proper responsive classes |
 | Simulation stuck | Missing \`ended\` state | Track \`ended\` separately from \`running\` |
 | Button does nothing | State logic error | Clear state machine with defined transitions |
@@ -296,13 +396,16 @@ Return ONLY the HTML document, no markdown fences or explanations.
 When calculating positions for simulation objects, account for UI overlays:
 
 \`\`\`javascript
+// Positions are in CSS pixels: use the stage's size, not canvas.height (device pixels).
+const height = stage.clientHeight;
+
 // BAD: Object overlaps with controls/HUD
-const objectY = baseY - (value / maxValue) * canvas.height;
+const objectY = baseY - (value / maxValue) * height;
 
 // GOOD: Reserve space for UI elements
 const TOP_MARGIN = 100;    // Space for HUD/stats at top
 const BOTTOM_MARGIN = 200; // Space for controls at bottom
-const playableHeight = canvas.height - TOP_MARGIN - BOTTOM_MARGIN;
+const playableHeight = height - TOP_MARGIN - BOTTOM_MARGIN;
 const objectY = baseY - BOTTOM_MARGIN - (value / maxValue) * playableHeight;
 \`\`\`
 
@@ -312,14 +415,138 @@ const objectY = baseY - BOTTOM_MARGIN - (value / maxValue) * playableHeight;
 - [ ] Reset button returns simulation to EXACT initial state
 - [ ] Button text matches button action correctly
 - [ ] Touch targets are at least 44px
-- [ ] Canvas resizes properly on window resize
+- [ ] Canvas size settles after a resize: bounded stage, canvas out of its flow
+- [ ] Error layers stay hidden unless a failure was detected
 - [ ] State machine is clear (running/paused/ended)
-- [ ] All state variables reset on resetSimulation()
+- [ ] All state variables reset on resetSimulation(), and every readout and button label follows
 - [ ] Works on both desktop and mobile browsers
 - [ ] **NO DUPLICATED HTML** - exactly ONE \`<!DOCTYPE html>\` tag
 - [ ] Simulation objects are visible and not hidden under UI overlays
 - [ ] **Visible animation: Objects visibly move/rotate when simulation runs**
-- [ ] **Animation is OBVIOUS, not subtle - user can tell simulation is running**",
+- [ ] **Animation is OBVIOUS, not subtle - user can tell simulation is running**
+
+
+## Available libraries
+The deployment hosts the libraries below. When a page needs one of them, load it from the URL listed here, exactly as written, instead of a public CDN. Load only libraries the page needs. Initialize classic-script libraries after their load event, or after DOMContentLoaded when using defer.
+- katex 0.16.38: /vendor/interactive/katex@0.16.38/dist/katex.min.js
+- three 0.160.0: /vendor/interactive/three@0.160.0/build/three.module.js
+- chart.js 4.4.8: /vendor/interactive/chart.js@4.4.8/dist/chart.umd.js
+- @tailwindcss/browser 4.1.18: /vendor/interactive/@tailwindcss/browser@4.1.18/dist/index.global.js
+- Three.js addons import-map prefix: /vendor/interactive/three@0.160.0/examples/jsm/
+For Three.js use an import map with "three" and "three/addons/" set to the URLs above. Tailwind uses the v4 browser runtime, not the legacy v3 Play CDN API. The platform handles KaTeX automatically when math delimiters occur in page text; do not load or call KaTeX yourself.
+
+## Math typesetting
+
+The platform loads KaTeX into any interactive page that contains math, whether in the page text or in strings your scripts write into the page, and typesets math wherever it appears, including text your scripts add or change after the page loads. Write math as LaTeX between \`\\(\` and \`\\)\` for inline math or \`\\[\` and \`\\]\` for display math, also inside script strings, and leave typesetting to the platform. Do not load KaTeX, MathJax or any other math library yourself, and do not call their functions: the page can run where such a copy never loads, and a call into a missing library stops the page's script.
+
+## REQUIRED: declared current state for newly generated interactive content (v1)
+
+This contract applies to every interactive content type. Report what the activity *is* right now, in the lesson's own terms — not a dump of JavaScript variables. The platform reads the same data for every lesson; there are no slider/circuit/game-specific collectors. Do not present protocol names to students.
+
+Wrap the whole interactive area in one element with \`id="experiment"\`. Inside it, publish exactly one non-executable \`<script type="application/json" data-maic-observation>\` node. This is separate from widget-config (source defaults). Keep existing action controls working. Do not add a state-request message listener; the platform owns collection. This evidence grants no tool or selector permissions.
+
+Publish a JSON object with these fields:
+
+\`\`\`json
+{
+  "summary": "Liquid density is 1400 kg/m³ and buoyancy is 4.116 N; the drawing still shows the 1000 kg/m³ result.",
+  "state": {
+    "liquid": { "density": 1400, "unit": "kg/m³", "buoyancy": 4.116 },
+    "object": { "displacedVolume": 300, "fullySubmerged": true },
+    "drawingPaused": true
+  },
+  "rendered": { "liquid": { "density": 1000, "buoyancy": 3.0 } }
+}
+\`\`\`
+
+- \`summary\`: one short sentence a student could read, describing the current state. Always include it — it is what the classroom falls back to when nothing else in the report is recognizable.
+- \`state\`: whatever this lesson naturally tracks — parameters the student set, what they built or connected, progress, mode. Shape it however fits the activity. Use stable keys or ids for things that persist, so the same object is recognizable across publications. Omit purely decorative animation coordinates. For positions meaningful to the lesson, keep them current and use student-readable terms, or explain the coordinate origin, direction and whether indices start at zero; an internal \`(row: 2, column: 1)\` must not be mistaken for “second row, first column.” Report a quantity you genuinely cannot determine as \`null\` and say so in \`summary\`; never substitute a source default or an earlier value.
+- \`rendered\` (optional): include it **only** when the activity has an explicit apply/run/draw step that can lag behind the inputs, and let it hold the values the last completed result actually used. Omit it entirely when the lesson redraws immediately — there the split carries no information.
+
+Total UTF-8 JSON must stay at or under 32768 bytes, and must not nest more than 64 levels deep. Those are the only limits the platform enforces: it reads what you publish without checking field names or types, so extra fields are allowed and are passed through unchanged, and a report that omits something is still delivered as-is rather than discarded.
+
+Publish the initial state even before the student presses Start. Publish after every semantic change, including reset and programmatic actions. Put publication in the functions that create/remove objects or change phase, including those called by timers or animation loops — not just in click/input handlers. For example, when a word appears automatically, publish the new word list immediately; do not leave “zero words” until the next user action. Pure animation frames need no extra publication unless a reported value changes. Input changes must be published even if the drawing or calculation has not completed.
+
+This is a replaced data projection, not history, storage or a new global state manager. Reading it has no side effects: state is published by the existing interaction and render paths, and collection only copies the inert data node. Do not redraw to answer a state request. A failed publication removes the old node rather than leaving stale values behind as current.
+
+Use this publication helper in the generated HTML; constructing the application state is your responsibility.
+
+Never call \`publishState()\` without an observation: it rejects \`undefined\` and aborts the current script. Use one canonical \`publishCurrentState()\` that constructs the complete observation from the current application state and passes it to \`publishState(observation)\`. Call that projection directly from the initial render, every semantic change, reset, and programmatic or timer-driven updates. Do not wrap or monkey-patch update functions after the fact to add publication; a late wrapper cannot repair a failure in the original update path.
+
+\`\`\`javascript
+function publishState(observation) {
+  const root = document.getElementById('experiment');
+  if (!root) throw new Error('Missing interaction scope');
+  try {
+    const raw = JSON.stringify(observation);
+    if (typeof raw !== 'string' || new TextEncoder().encode(raw).length > 32768)
+      throw new Error('Invalid state publication');
+    let node = root.querySelector('script[data-maic-observation]');
+    if (!node) {
+      node = document.createElement('script');
+      node.type = 'application/json';
+      node.setAttribute('data-maic-observation', '');
+      root.appendChild(node);
+    }
+    node.textContent = raw;
+  } catch (error) {
+    root.querySelectorAll('script[data-maic-observation]').forEach(node => node.remove());
+    throw error;
+  }
+}
+\`\`\`
+
+For example, a reveal activity can use this single projection path. Adapt the state and summary to the lesson; construct the state before the first render and reset it before rendering again.
+
+\`\`\`javascript
+let activityState = { step: 1 };
+
+function publishCurrentState() {
+  publishState({
+    summary: 'Step ' + activityState.step,
+    state: { step: activityState.step }
+  });
+}
+
+function updateReveal() {
+  document.getElementById('step').textContent = activityState.step;
+  publishCurrentState();
+}
+
+function advanceStep() {
+  activityState.step++;
+  updateReveal();
+}
+
+function resetActivity() {
+  activityState = { step: 1 };
+  updateReveal();
+}
+
+updateReveal(); // Initial state, before any user action.
+// Buttons, programmatic actions, and timers call advanceStep/resetActivity
+// directly; each path renders and publishes its current state.
+\`\`\`
+
+If the activity has an apply/run step, capture the inputs a run actually used when it starts, and write them to \`rendered\` only after that run has successfully become the displayed result. A cancelled or superseded run must not update \`rendered\`, and a parameter edit alone must never advance it.
+
+## REQUIRED: what the page shows must match its state
+
+Each rule below prevents a failure that is still valid JavaScript, so a syntax check accepts it and only the browser shows it.
+
+**A hidden layer stays hidden.** An author \`display\` rule (\`display: grid\`, \`flex\`, \`block\`) overrides the \`hidden\` attribute, so an error or result layer marked \`hidden\` would still cover the page. Whenever an element that can carry \`hidden\` also gets a \`display\` value, include this rule once:
+
+\`\`\`css
+[hidden]:not([hidden="until-found"]) { display: none !important; }
+\`\`\`
+
+Show and hide such an element only through the attribute: \`element.removeAttribute('hidden')\` to show it and \`element.setAttribute('hidden', '')\` to hide it, which also works for SVG elements. Never show it by setting \`style.display\`; the rule above wins over inline styles. This includes \`REVEAL_ELEMENT\` handlers. Show an error layer only from the path that detected the failure (for example \`getContext('2d')\` returned \`null\`, or initialization threw), never by default.
+
+**A drawing surface never sizes the element it is measured from.** Give the container of a canvas, SVG or WebGL renderer a size that does not depend on its content: let it fill the remaining space of a full-viewport layout, or give it a bounded height (for example \`clamp(260px, 60vh, 640px)\` when the layout stacks on narrow screens) or an \`aspect-ratio\`. Make it \`position: relative\`, and place the surface inside it with \`position: absolute; inset: 0; width: 100%; height: 100%\`. Read sizes only from the container, and never write a measured size to the container's \`style\`. When the container's height comes from its content and the surface sits in that flow, each resize enlarges the element being observed, and the drawing grows until it disappears.
+
+For a 2D canvas, set \`canvas.width\` and \`canvas.height\` to the container's \`clientWidth\` and \`clientHeight\` times \`devicePixelRatio\`, only when they changed, then call \`ctx.setTransform(dpr, 0, 0, dpr, 0, 0)\`. Do all drawing and layout math in the container's CSS size, never in \`canvas.width\` or \`canvas.height\`, which are device pixels and would place objects and margins off by the pixel ratio.
+
+**One render path from state to screen.** Keep one render function (\`render()\`, or the one the template names, such as \`renderStep()\`) that writes every readout, label, button text and enabled state, and redraws, from the current state. Initialization, every update, presets, \`SET_WIDGET_STATE\` and reset all call it. Reset stops the timers and animation loops that advance the activity, rebuilds the state from the same initial values used at startup, then calls the render function. A loop that only redraws, such as a 3D scene's render loop, keeps running. Resetting the state without rendering leaves readouts showing the previous run.",
     "user": "Create a simulation widget for: Energy transfer
 
 ## Concept Overview
@@ -636,6 +863,33 @@ Open-ended question requiring a written response. No options or predefined answe
 - Avoid "all of the above" or "none of the above" options
 - Randomize correct answer position
 
+### Option field contract
+
+\`value\` and \`label\` are different fields. Never reverse them.
+
+- \`value\` MUST be a single ASCII uppercase letter A-Z. It is a JSON Schema enum: the selection key, never the option text.
+- \`label\` MUST be the option content text the learner reads. It must not be a bare letter standing in for that content.
+- \`answer\` MUST be an array of those \`value\` letters, such as \`["A"]\` or \`["A", "C"]\`. Do not put option content in \`answer\`.
+- Invalid: \`{ "value": "(6, 2)", "label": "A" }\`. Content belongs in \`label\`; the letter belongs in \`value\`.
+
+Each choice option binds to this schema (\`value\` cannot be free text):
+
+\`\`\`json
+{
+  "type": "object",
+  "required": ["label", "value"],
+  "additionalProperties": false,
+  "properties": {
+    "label": { "type": "string", "description": "Option content text shown to the learner." },
+    "value": {
+      "type": "string",
+      "enum": ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z"],
+      "description": "Selection key. One ASCII uppercase letter. Never the option content."
+    }
+  }
+}
+\`\`\`
+
 ### Difficulty Guidelines
 
 | Difficulty | Description                                          |
@@ -646,7 +900,7 @@ Open-ended question requiring a written response. No options or predefined answe
 
 ## Output Format
 
-Output a JSON array of question objects. Every question must have \`analysis\` and \`points\`:
+Output a JSON array of question objects. Every question must have \`analysis\` and \`points\`. Choice option \`value\` is the enum A-Z above; \`label\` is content; \`answer\` copies \`value\` letters only:
 
 \`\`\`json
 [
@@ -696,7 +950,7 @@ Question Count: 1, Difficulty: easy, Question Types: single
 ## Language Directive
 Teach in English.
 
-Output a JSON array directly (no explanation, no code blocks, no LaTeX). Use the exact object shape from the system prompt — \`options\` as \`{ "label", "value" }\` objects with single-letter values (A, B, C, ...) and \`answer\` as an array of the correct option VALUES:
+Output a JSON array directly (no explanation, no code blocks, no LaTeX). Each choice option MUST be \`{ "label": "<content text>", "value": "<one ASCII uppercase letter A-Z>" }\`. \`value\` is an enum A-Z and is never the option content; \`label\` is the content text and is never just the letter. Never reverse them (invalid: \`{ "value": "(6, 2)", "label": "A" }\`). \`answer\` MUST be an array of those \`value\` letters, never the content text:
 [{"id":"q1","type":"single","question":"Question text","options":[{"label":"Option A content","value":"A"},{"label":"Option B content","value":"B"},{"label":"Option C content","value":"C"},{"label":"Option D content","value":"D"}],"answer":["A"]}]",
   },
   "slide": {
@@ -827,6 +1081,8 @@ You are an educational content designer. Generate well-structured slide componen
 \`\`\`
 
 **Required Fields**: \`id\`, \`type\`, \`left\`, \`top\`, \`width\`, \`height\`, \`path\` (SVG path), \`viewBox\` [width, height], \`fill\` (hex color), \`fixedRatio\`
+
+**Optional Fields**: \`rotate\`: finite angle in degrees; positive values rotate clockwise around the centre of the unrotated bounding box
 
 **Common Shapes**:
 
@@ -1658,4 +1914,81 @@ Teach in English.
 {"background":{"type":"solid","color":"#ffffff"},"elements":[{"id":"title_001","type":"text","left":60,"top":50,"width":880,"height":76,"content":"<p style=\\"font-size:32px;\\"><strong>Title Content</strong></p>","defaultFontName":"","defaultColor":"#333333"},{"id":"content_001","type":"text","left":60,"top":150,"width":880,"height":130,"content":"<p style=\\"font-size:18px;\\">• Point One</p><p style=\\"font-size:18px;\\">• Point Two</p><p style=\\"font-size:18px;\\">• Point Three</p>","defaultFontName":"","defaultColor":"#333333"}]}",
   },
 }
+`;
+
+exports[`pins representative system and user prompts for every scene kind 2`] = `
+"Create a simulation widget for: Energy transfer
+
+## Concept Overview
+
+Explore how energy changes with a slider.
+
+## Key Points
+
+Move the slider
+Observe the result
+
+## Variables to Expose
+
+Ramp height (0.5–3, m), Friction (0–0.5), mass
+
+## Design Idea
+
+A ball rolls down a ramp; bars show kinetic and potential energy.
+
+## Additional Design Requirements
+
+- Controls:
+  - Height slider
+  - Release button
+- Readouts:
+  - Kinetic energy (J)
+  - Speed at the bottom
+
+## Language
+
+Teach in English.
+
+---
+
+Generate a complete, interactive HTML simulation with these MANDATORY features:
+
+### Structure
+1. **Embedded JSON config** in \`<script type="application/json" id="widget-config">\`
+2. **Control panel** with sliders for each variable
+3. **Canvas visualization** with proper sizing
+4. **Preset buttons** for common scenarios
+
+### Mobile Responsiveness (CRITICAL)
+1. **Control panel MUST NOT overlap canvas on mobile**
+2. Use \`flex-col md:flex-row\` layout with proper spacing
+3. Control panel: \`max-h-[40vh] md:max-h-screen\` with overflow scroll
+4. Canvas container: \`min-h-[300px]\` to ensure visibility
+5. Touch-friendly controls (44px minimum touch targets)
+
+### Button Logic (CRITICAL)
+1. **Main button MUST handle all states correctly:**
+   - "启动" → Starts simulation
+   - "暂停" → Pauses running simulation
+   - "重新开始" → Resets to initial state, then starts fresh
+2. **Reset function MUST reset ALL state variables** (position, velocity, time, etc.)
+3. Use clear state tracking: \`{ running: boolean, ended: boolean, paused: boolean }\`
+
+### Canvas
+1. Auto-resize on window resize
+2. Clear visualization with grid or guides
+3. Real-time data display overlay
+4. Proper scaling for different screen sizes
+
+### Interactivity
+1. Real-time updates when sliders change
+2. Presets apply and reset simulation
+3. Keyboard shortcuts (Space = toggle, R = reset)
+4. Touch gestures for mobile
+
+### Visual Polish
+1. Show current simulation state (running/paused/ended)
+2. Animate transitions
+3. Clear feedback when simulation ends
+4. High contrast colors for visibility"
 `;

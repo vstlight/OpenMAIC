@@ -1,332 +1,908 @@
 'use client';
 
-import { useState, useCallback } from 'react';
+// The "Token Plan" section. On the left, the region's plans: the connected
+// ones in priority order, each with what is left of its quota (or its
+// balance) and a warning when its tier lacks a capability, then the ones not
+// connected. On the right, the selected plan: its account (key, priority,
+// vendor console), its quota as meters with reset times, what it gives the
+// workspace as one card per capability, and its models and default routing
+// folded away. A plan is a provider of the workspace's model settings on the
+// server: saving its key adds that provider (or replaces its key) and applies
+// the plan's recommended configuration to the slots. When that would replace
+// models the workspace picked, the user is asked first: the plan's setup, or
+// keep theirs and fill only the empty slots. Disconnecting removes the
+// provider. A plan the server configures is shown as connected, read-only.
+
+import { useState, useRef } from 'react';
+import { createPortal } from 'react-dom';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
-import { Label } from '@/components/ui/label';
-import { Switch } from '@/components/ui/switch';
 import {
+  ChevronDown,
+  ExternalLink,
   Eye,
   EyeOff,
-  CheckCircle2,
-  Zap,
-  MessageSquare,
-  Image as ImageIcon,
-  Video,
-  Volume2,
-  Search,
-  type LucideIcon,
+  Globe,
+  KeyRound,
+  Layers,
+  MoreHorizontal,
+  Unlink,
 } from 'lucide-react';
+import { toast } from 'sonner';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog';
 import { useI18n } from '@/lib/hooks/use-i18n';
 import { cn } from '@/lib/utils';
-import { useSettingsStore } from '@/lib/store/settings';
 import {
   TOKEN_PLAN_PRESETS,
-  PRESET_CATEGORY_ORDER,
   MODALITY_ORDER,
+  tokenPlanInRegion,
   type TokenPlanPreset,
-  type PresetCategory,
   type TokenPlanModality,
+  type TokenPlanRegion,
 } from '@/lib/config/token-plan-presets';
-import { applyTokenPlan, removeTokenPlan } from '@/lib/config/apply-token-plan';
+import { tokenPlanPresetId } from '@/lib/config/preset-ids';
+import type {
+  ApplyChange,
+  ModelSettingsView,
+  PresetView,
+  ProviderView,
+} from '@/lib/model-settings/client';
+import { modelName, providerLabel, splitRef } from '@/lib/model-settings/edit';
+import { planProvider } from '@/lib/model-settings/services';
+import { tokenPlanListed } from '@/lib/model-settings/shape';
+import {
+  connectConflicts,
+  connectTokenPlan,
+  type PlanApplyMode,
+  type PlanConflict,
+} from '@/lib/model-settings/token-plan';
+import {
+  applyErrorText,
+  CredentialStorageHint,
+  reportApply,
+  ServerOnlyNotice,
+} from './server-settings';
+import { MS, slotName } from './models/slot-meta';
+import { CARD_CAPABILITIES, PlanCapabilities, planModels } from './plan-capabilities';
+import { isBalanceOnly, PlanQuotaCard, QuotaSummary, usePlanQuotas } from './plan-quota';
 
-const CATEGORY_LABEL_KEYS: Record<PresetCategory, string> = {
-  token_plan: 'settings.presetCategory.tokenPlan',
-  aggregator: 'settings.presetCategory.aggregator',
-  third_party: 'settings.presetCategory.thirdParty',
-  official: 'settings.presetCategory.official',
-};
+const REGIONS: readonly TokenPlanRegion[] = ['domestic', 'international'];
 
-const MODALITY_LABEL_KEYS: Record<TokenPlanModality, string> = {
-  llm: 'settings.providers',
-  image: 'settings.imageSettings',
-  video: 'settings.videoSettings',
-  tts: 'settings.ttsSettings',
-  webSearch: 'settings.webSearchSettings',
-};
-
-const MODALITY_ICONS: Record<TokenPlanModality, LucideIcon> = {
-  llm: MessageSquare,
-  image: ImageIcon,
-  video: Video,
-  tts: Volume2,
-  webSearch: Search,
-};
-
-/** The models a preset declares for one modality (display-only, no probing). */
-function modalityModels(preset: TokenPlanPreset, m: TokenPlanModality): string[] {
-  const target = preset.modalities[m];
-  if (!target) return [];
-  if (target.defaultModels?.length) return target.defaultModels;
-  if (target.defaultModelId) return [target.defaultModelId];
-  return [target.providerId];
+/** Display-name mapping: the volcengine-ark preset is shown as "Seed". */
+function presetDisplayName(preset: TokenPlanPreset): string {
+  if (preset.id === 'minimax') return 'MiniMax';
+  if (preset.id === 'volcengine-ark') return 'Seed';
+  return preset.name;
 }
 
-export function TokenPlanSettings() {
-  const { t } = useI18n();
-  const setProviderConfig = useSettingsStore((s) => s.setProviderConfig);
-  const setImageProviderConfig = useSettingsStore((s) => s.setImageProviderConfig);
-  const setVideoProviderConfig = useSettingsStore((s) => s.setVideoProviderConfig);
-  const setTTSProviderConfig = useSettingsStore((s) => s.setTTSProviderConfig);
-  const setWebSearchProviderConfig = useSettingsStore((s) => s.setWebSearchProviderConfig);
-  const setImageProvider = useSettingsStore((s) => s.setImageProvider);
-  const setImageModelId = useSettingsStore((s) => s.setImageModelId);
-  const setVideoProvider = useSettingsStore((s) => s.setVideoProvider);
-  const setVideoModelId = useSettingsStore((s) => s.setVideoModelId);
-  // Read provider configs so the page can reflect already-persisted state
-  // (other settings panels read the store directly; this page must too).
-  const providersConfig = useSettingsStore((s) => s.providersConfig);
+/** Balance-management link: `{vendor site}/credits`, preserving the query. */
+function portalCreditsUrl(base: string): string {
+  try {
+    const url = new URL(base);
+    url.pathname = `${url.pathname.replace(/\/+$/, '')}/credits`;
+    return url.toString();
+  } catch {
+    return base;
+  }
+}
 
-  const [selected, setSelected] = useState<TokenPlanPreset | null>(null);
+/** Models & default routing rows: capability (· stage) → the plan's default model. */
+interface ModelPlanItem {
+  capability: TokenPlanModality;
+  stageId?: string;
+  model?: string;
+}
+
+const MODEL_PLAN_STAGE_LABEL_KEYS: Record<string, string> = {
+  'scene-content:slide': 'settings.tokenPlan.stageSlide',
+  'scene-content:interactive': 'settings.tokenPlan.stageInteractive',
+};
+
+const MODEL_PLAN_CAPABILITY_LABEL_KEYS: Record<TokenPlanModality, string> = {
+  llm: 'settings.tokenPlan.capLlm',
+  image: 'settings.tokenPlan.capImage',
+  video: 'settings.tokenPlan.capVideo',
+  tts: 'settings.tokenPlan.capTts',
+  asr: 'settings.tokenPlan.capAsr',
+  document: 'settings.tokenPlan.capDocument',
+  webSearch: 'settings.tokenPlan.capWebSearch',
+  webFetch: 'settings.tokenPlan.capWebFetch',
+};
+
+/** The slot capability a modality's provider serves. */
+const MODALITY_CAPABILITY = {
+  llm: 'chat',
+  image: 'image',
+  video: 'video',
+  tts: 'tts',
+  asr: 'asr',
+  document: 'document',
+  webSearch: 'webSearch',
+  webFetch: 'webFetch',
+} as const satisfies Record<TokenPlanModality, string>;
+
+function modelPlanItems(
+  preset: TokenPlanPreset,
+  offered: (m: TokenPlanModality) => boolean,
+): ModelPlanItem[] {
+  const items: ModelPlanItem[] = [];
+  const llm = offered('llm') ? preset.modalities.llm : undefined;
+  if (llm) {
+    items.push({ capability: 'llm', model: llm.defaultModelId ?? llm.defaultModels?.[0] });
+    for (const [stageId, model] of Object.entries(llm.stageRoutes ?? {})) {
+      items.push({ capability: 'llm', stageId, model });
+    }
+  }
+  for (const capability of ['image', 'video', 'tts'] as const) {
+    const target = offered(capability) ? preset.modalities[capability] : undefined;
+    if (target) {
+      items.push({
+        capability,
+        model: target.defaultModelId ?? target.defaultModels?.[0],
+      });
+    }
+  }
+  // Modalities with no model concept (e.g. web search) do not disclose a model.
+  for (const capability of ['asr', 'document', 'webSearch', 'webFetch'] as const) {
+    if (preset.modalities[capability] && offered(capability)) items.push({ capability });
+  }
+  return items;
+}
+
+/** Service logo container: TokenDance uses a filled black background, others white with size-6. */
+function PresetLogo({ preset, size = 'md' }: { preset: TokenPlanPreset; size?: 'md' | 'lg' }) {
+  const box = size === 'lg' ? 'size-10' : 'size-8';
+  if (!preset.icon) return <span className={cn(box, 'shrink-0 rounded-lg bg-muted')} />;
+  return (
+    <span
+      className={cn(
+        box,
+        'flex shrink-0 items-center justify-center overflow-hidden rounded-lg border',
+        preset.id === 'tokendance' ? 'border-transparent bg-black' : 'bg-background',
+      )}
+    >
+      {}
+      <img
+        src={preset.icon}
+        alt=""
+        className={cn('object-contain', preset.id === 'tokendance' ? 'size-full' : 'size-6')}
+      />
+    </span>
+  );
+}
+
+const pill = 'inline-flex items-center rounded-full border px-1.5 py-0.5 text-[11px] font-medium';
+
+export function TokenPlanSettings({
+  view,
+  apply,
+  regionSlot,
+}: {
+  view: ModelSettingsView;
+  apply: ApplyChange;
+  /** Where the dialog's header hosts the region switch; without one the panel shows it. */
+  regionSlot?: HTMLElement | null;
+}) {
+  const { t, locale } = useI18n();
+  const tp = 'settings.tokenPlan';
+
+  // The page opens on the side matching the interface language; mainland
+  // plans are for the Simplified Chinese interface.
+  const [region, setRegion] = useState<TokenPlanRegion>(
+    locale === 'zh-CN' ? 'domestic' : 'international',
+  );
+
+  /** The plan's preset as the server offers it to the workspace (absent: the workspace cannot add it). */
+  const presetOf = (preset: TokenPlanPreset) =>
+    view.presets.find((entry) => entry.id === tokenPlanPresetId(preset.id));
+  /** The plan's provider in the settings: connected when there is one. */
+  const providerOf = (preset: TokenPlanPreset) => planProvider(view, tokenPlanPresetId(preset.id));
+
+  // A region's plans connecting can still change something with, and the
+  // ones already connected (to manage or disconnect); see tokenPlanListed.
+  // Connected plans come first, in priority order (the preset order).
+  const plansIn = (side: TokenPlanRegion) => {
+    const listed = TOKEN_PLAN_PRESETS.filter((plan) => {
+      if (!tokenPlanInRegion(plan, side)) return false;
+      const preset = presetOf(plan);
+      return !!preset && tokenPlanListed(view, preset);
+    });
+    const connected = listed.filter((plan) => !!providerOf(plan));
+    return { connected, available: listed.filter((plan) => !providerOf(plan)) };
+  };
+  const { connected, available } = plansIn(region);
+  const plans = [...connected, ...available];
+  const [selectedId, setSelectedId] = useState<string>(plans[0]?.id ?? '');
   const [apiKey, setApiKey] = useState('');
   const [showKey, setShowKey] = useState(false);
-  const [activeTab, setActiveTab] = useState<TokenPlanModality>('llm');
+  const [editingKey, setEditingKey] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [disconnectOpen, setDisconnectOpen] = useState(false);
+  /** A connect waiting for the user to choose how to treat the slots it would replace. */
+  const [pending, setPending] = useState<{
+    plan: TokenPlanPreset;
+    key: string;
+    conflicts: PlanConflict[];
+  } | null>(null);
+  const tabRefs = useRef(new Map<string, HTMLButtonElement>());
 
-  const grouped = PRESET_CATEGORY_ORDER.map((cat) => ({
-    category: cat,
-    presets: TOKEN_PLAN_PRESETS.filter((p) => p.category === cat),
-  })).filter((g) => g.presets.length > 0);
+  const selected = plans.find((p) => p.id === selectedId) ?? plans[0] ?? null;
 
-  const presetSavedKey = (preset: TokenPlanPreset): string => {
-    const llmId = preset.modalities.llm?.providerId;
-    return llmId ? (providersConfig[llmId as keyof typeof providersConfig]?.apiKey ?? '') : '';
+  // The quota of each connected plan with a key of the workspace's own (the
+  // deployment's are not the workspace's to ask about).
+  const quotaIds = connected
+    .map(providerOf)
+    .filter(
+      (provider): provider is ProviderView =>
+        provider?.source === 'workspace' && !!provider.key?.set,
+    )
+    .map((provider) => provider.id);
+  const quotas = usePlanQuotas(quotaIds);
+
+  /** A connected plan's priority among the region's connected plans. */
+  const rankOf = (plan: TokenPlanPreset) => connected.indexOf(plan) + 1;
+
+  /** How a card names a service: a connected plan (with its rank, unless not wanted), else its provider. */
+  const serviceName = (providerId: string, withRank = true): string => {
+    const provider = view.providers.find((entry) => entry.id === providerId);
+    const plan = provider
+      ? TOKEN_PLAN_PRESETS.find((entry) => tokenPlanPresetId(entry.id) === provider.preset)
+      : undefined;
+    if (!plan) return providerLabel(view, providerId, t);
+    const rank = withRank && connected.includes(plan) ? ` (#${rankOf(plan)})` : '';
+    // Another connection of the plan shown: say whose it is.
+    const whose =
+      selected && plan.id === selected.id && provider
+        ? ` · ${t(provider.source === 'deployment' ? `${tp}.deploymentConnection` : `${tp}.workspaceConnection`)}`
+        : '';
+    return `${presetDisplayName(plan)}${rank}${whose}`;
   };
 
-  // Whether a preset's LLM provider already has a saved key (= enabled).
-  const isPresetEnabled = (preset: TokenPlanPreset): boolean => !!presetSavedKey(preset);
-
-  // The modalities a preset declares, in display order — drives the tab bar.
-  const presetModalities = (preset: TokenPlanPreset): TokenPlanModality[] =>
-    MODALITY_ORDER.filter((m) => preset.modalities[m]);
-
-  const disablePreset = (preset: TokenPlanPreset) => {
-    removeTokenPlan(preset, {
-      setProviderConfig,
-      setImageProviderConfig,
-      setVideoProviderConfig,
-      setTTSProviderConfig,
-      setWebSearchProviderConfig,
-    });
-  };
+  /** The capabilities a connected plan's account lacks. */
+  const missingCards = (provider: ProviderView | undefined) =>
+    CARD_CAPABILITIES.filter(({ capability }) =>
+      provider?.unsupportedCapabilities?.includes(capability),
+    );
 
   const selectPreset = (preset: TokenPlanPreset) => {
-    setSelected(preset);
-    setActiveTab(presetModalities(preset)[0] ?? 'llm');
-    // Reflect persisted state: prefill the saved key so the page isn't blank
-    // on return (mirrors how other settings panels read the store).
-    setApiKey(presetSavedKey(preset));
+    setSelectedId(preset.id);
+    setApiKey('');
+    setEditingKey(false);
+    setDisconnectOpen(false);
   };
 
-  // Apply is synchronous: seed every declared modality's config + select the
-  // first image/video model, then we're done. No probing — the models a plan
-  // offers are listed as-is, and the user picks/toggles on the generation bar.
-  const handleApply = useCallback(() => {
-    const trimmedKey = apiKey.trim();
+  // Switching sides selects that side's first plan.
+  const selectRegion = (side: TokenPlanRegion) => {
+    if (side === region) return;
+    setRegion(side);
+    const { connected: first, available: rest } = plansIn(side);
+    const next = first[0] ?? rest[0];
+    if (next) selectPreset(next);
+  };
+
+  // Disconnect = remove the plan's provider; the stages that used it follow
+  // the ones above them again.
+  const disconnect = async (preset: TokenPlanPreset) => {
+    const provider = providerOf(preset);
+    setDisconnectOpen(false);
+    setApiKey('');
+    setEditingKey(false);
+    if (!provider || provider.source !== 'workspace') return;
+    if (reportApply(await apply({ kind: 'remove-provider', id: provider.id }, view), t)) {
+      toast.success(t('settings.tokenPlan.saved'));
+    }
+  };
+
+  // Connect (or save a new key): add the plan's provider, or replace its key,
+  // then apply the plan's recommended configuration to the slots.
+  const connect = async (plan: TokenPlanPreset, key: string, mode: PlanApplyMode) => {
+    const preset = presetOf(plan);
+    if (!preset) return;
+    setSaving(true);
+    try {
+      const result = await connectTokenPlan(apply, view, preset, key, mode);
+      if (result.status === 'failed') {
+        toast.error(applyErrorText(result, t));
+        return;
+      }
+      if (result.status === 'partial' && result.message) {
+        toast.warning(applyErrorText({ reason: result.reason ?? '', message: result.message }, t));
+      }
+      // The key was saved: the quota shown must be the new key's.
+      if (quotaIds.includes(result.providerId)) quotas.refresh(result.providerId, true);
+      setApiKey('');
+      setEditingKey(false);
+      toast.success(t('settings.tokenPlan.saved'));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  // Save = connect. When the plan's recommendation would replace models the
+  // workspace picked, ask first; otherwise apply it straight away.
+  const handleApply = async (key: string) => {
+    const trimmedKey = key.trim();
     if (!selected || !trimmedKey) return;
-    applyTokenPlan(selected, trimmedKey, {
-      setProviderConfig,
-      setImageProviderConfig,
-      setVideoProviderConfig,
-      setTTSProviderConfig,
-      setWebSearchProviderConfig,
-      setImageProvider,
-      setImageModelId,
-      setVideoProvider,
-      setVideoModelId,
-    });
-  }, [
-    selected,
-    apiKey,
-    setProviderConfig,
-    setImageProviderConfig,
-    setVideoProviderConfig,
-    setTTSProviderConfig,
-    setWebSearchProviderConfig,
-    setImageProvider,
-    setImageModelId,
-    setVideoProvider,
-    setVideoModelId,
-  ]);
+    const preset = presetOf(selected);
+    if (!preset) return;
+    const conflicts = connectConflicts(view, preset);
+    if (conflicts.length) {
+      setPending({ plan: selected, key: trimmedKey, conflicts });
+      return;
+    }
+    await connect(selected, trimmedKey, 'overwrite');
+  };
 
-  return (
-    <div className="flex max-w-4xl flex-col gap-6">
-      <div>
-        <h3 className="text-sm font-semibold mb-1">{t('settings.tokenPlan.title')}</h3>
-        <p className="text-xs text-muted-foreground">{t('settings.tokenPlan.desc')}</p>
+  const choose = (mode: PlanApplyMode) => {
+    const chosen = pending;
+    setPending(null);
+    if (chosen) void connect(chosen.plan, chosen.key, mode);
+  };
+
+  /** How a slot's assignment reads in the confirmation: its model (and provider), or off. */
+  const assignmentLabel = (
+    conflict: PlanConflict,
+    ref: string | null,
+    preset: PresetView | undefined,
+  ): string => {
+    if (ref === null) return t(`${MS}.card.off`);
+    const capability = conflict.slot.capability;
+    const { providerId, modelId } = splitRef(ref);
+    const known = view.providers.some((provider) => provider.id === providerId);
+    const provider = known ? providerLabel(view, providerId, t) : (preset?.name ?? providerId);
+    if (!modelId) return provider;
+    const model = known
+      ? modelName(view, capability, providerId, modelId)
+      : (preset?.capabilities[capability]?.models.find((entry) => entry.id === modelId)?.name ??
+        modelId);
+    return `${model} · ${provider}`;
+  };
+
+  const planRow = (preset: TokenPlanPreset, index: number) => {
+    const provider = providerOf(preset);
+    const active = selected?.id === preset.id;
+    const missing = missingCards(provider);
+    const join = (labels: string[]) => labels.join(t(`${tp}.listSeparator`));
+    return (
+      <button
+        type="button"
+        role="tab"
+        key={preset.id}
+        aria-selected={active}
+        tabIndex={active ? 0 : -1}
+        ref={(node) => {
+          if (node) tabRefs.current.set(preset.id, node);
+          else tabRefs.current.delete(preset.id);
+        }}
+        onClick={() => selectPreset(preset)}
+        onKeyDown={(event) => {
+          const delta =
+            event.key === 'ArrowRight' || event.key === 'ArrowDown'
+              ? 1
+              : event.key === 'ArrowLeft' || event.key === 'ArrowUp'
+                ? -1
+                : 0;
+          if (!delta && event.key !== 'Home' && event.key !== 'End') return;
+          event.preventDefault();
+          const next =
+            plans[
+              event.key === 'Home'
+                ? 0
+                : event.key === 'End'
+                  ? plans.length - 1
+                  : (index + delta + plans.length) % plans.length
+            ];
+          selectPreset(next);
+          tabRefs.current.get(next.id)?.focus();
+        }}
+        className={cn(
+          'flex w-full min-w-0 items-center gap-2.5 rounded-lg border px-2.5 py-2 text-left outline-none transition-colors duration-150 focus-visible:ring-2 focus-visible:ring-ring',
+          active ? 'border-border bg-background shadow-sm' : 'border-transparent hover:bg-muted/60',
+        )}
+      >
+        <PresetLogo preset={preset} />
+        <span className="min-w-0 flex-1">
+          <span className="block truncate text-sm font-medium leading-5">
+            {presetDisplayName(preset)}
+          </span>
+          {/* The tier lacking a capability is said in the status line, by its short name. */}
+          <span
+            className="flex min-w-0 items-center gap-1.5 text-[11px] leading-5 text-muted-foreground"
+            title={
+              missing.length > 0
+                ? t(`${tp}.missingCapability`, { name: join(missing.map(({ label }) => t(label))) })
+                : undefined
+            }
+          >
+            <span
+              className={cn(
+                'size-1.5 shrink-0 rounded-full',
+                !provider
+                  ? 'bg-muted-foreground/40'
+                  : missing.length > 0
+                    ? 'bg-amber-600'
+                    : 'bg-green-600',
+              )}
+              aria-hidden="true"
+            />
+            <span className="truncate">
+              {t(provider ? `${tp}.statusConnected` : `${tp}.statusNotConnected`)}
+              {missing.length > 0 &&
+                ` · ${t(`${tp}.missingCapabilityShort`, { name: join(missing.map(({ short }) => t(short))) })}`}
+            </span>
+          </span>
+        </span>
+        <span className="flex shrink-0 flex-col items-end text-xs leading-5">
+          {provider ? (
+            <>
+              <span className="rounded bg-muted px-1.5 text-[11px] leading-4 text-muted-foreground">
+                #{rankOf(preset)}
+              </span>
+              <span className="font-medium">
+                {provider.source === 'workspace' && provider.key?.set ? (
+                  <QuotaSummary entry={quotas.entries[provider.id]} />
+                ) : (
+                  <span className="text-muted-foreground">—</span>
+                )}
+              </span>
+            </>
+          ) : (
+            <span className="text-muted-foreground">{t(`${tp}.setUp`)}</span>
+          )}
+        </span>
+      </button>
+    );
+  };
+
+  const keyForm = (plan: TokenPlanPreset, updating: boolean) => (
+    <form
+      className="space-y-2"
+      onSubmit={(event) => {
+        event.preventDefault();
+        void handleApply(apiKey);
+      }}
+    >
+      {/* Field and its commit share one row; the button never owns a line. */}
+      <div className="flex flex-wrap items-center gap-2">
+        <div className="relative min-w-0 flex-1 basis-40">
+          <Input
+            type={showKey ? 'text' : 'password'}
+            autoComplete="new-password"
+            spellCheck={false}
+            aria-label={t(`${tp}.apiKey`)}
+            placeholder={plan.apiKeyPlaceholder ?? 'sk-...'}
+            value={apiKey}
+            onChange={(e) => setApiKey(e.target.value)}
+            className="h-9 bg-background pr-8"
+          />
+          <button
+            type="button"
+            onClick={() => setShowKey(!showKey)}
+            aria-label={t(`${tp}.apiKey`)}
+            className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+          >
+            {showKey ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+          </button>
+        </div>
+        <Button type="submit" size="sm" className="shrink-0" disabled={!apiKey.trim() || saving}>
+          {t(updating ? `${tp}.updateKey` : `${tp}.saveKey`)}
+        </Button>
       </div>
+      <p className="text-xs leading-5 text-muted-foreground">{t(`${tp}.applyModelsNote`)}</p>
+    </form>
+  );
 
-      <div className="grid gap-6 lg:grid-cols-[280px_minmax(0,1fr)]">
-        <div className="space-y-4">
-          <Label className="text-sm">{t('settings.tokenPlan.selectPlan')}</Label>
-          <div className="space-y-4">
-            {grouped.map((group) => (
-              <div key={group.category} className="space-y-1">
-                <div className="px-2 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
-                  {t(CATEGORY_LABEL_KEYS[group.category])}
-                </div>
-                <div className="space-y-0.5">
-                  {group.presets.map((preset) => (
-                    <button
-                      key={preset.id}
-                      onClick={() => selectPreset(preset)}
-                      className={cn(
-                        'flex w-full items-center gap-2 rounded-md px-2 py-2 text-left text-sm transition-colors',
-                        selected?.id === preset.id
-                          ? 'bg-muted text-foreground'
-                          : 'hover:bg-muted/60',
-                      )}
-                    >
-                      {preset.icon ? (
-                        <img src={preset.icon} alt="" className="size-5 shrink-0 rounded" />
-                      ) : (
-                        <span className="size-5 shrink-0 rounded bg-muted" />
-                      )}
-                      <span className="min-w-0 flex-1 truncate font-medium">{preset.name}</span>
-                      {isPresetEnabled(preset) && (
-                        <CheckCircle2 className="size-3.5 shrink-0 text-muted-foreground" />
-                      )}
-                    </button>
-                  ))}
-                </div>
+  const linkButton =
+    'inline-flex h-8 shrink-0 items-center gap-1.5 rounded-md border bg-background px-3 text-xs font-medium outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring';
+
+  const detail = (plan: TokenPlanPreset) => {
+    const provider = providerOf(plan);
+    // Only the workspace's own plan can have its key updated or be disconnected.
+    const own = provider?.source === 'workspace';
+    const canConnect = !provider && !!presetOf(plan);
+    const name = presetDisplayName(plan);
+    const offered = (m: TokenPlanModality) =>
+      !provider || !!provider.capabilities[MODALITY_CAPABILITY[m]];
+    const modalities = MODALITY_ORDER.filter((m) => plan.modalities[m] && offered(m));
+    const modelCount = modalities.reduce((sum, m) => sum + planModels(plan, m).length, 0);
+    const quota = provider ? quotas.entries[provider.id]?.quota : undefined;
+    const regionLabel = [
+      plan.region ? t(`settings.providerLinks.${plan.region}`) : t(`${tp}.regionGlobal`),
+      // The vendor reports a balance and no quota windows: billed as used.
+      ...(isBalanceOnly(quota) ? [t(`${tp}.payAsYouGo`)] : []),
+    ].join(' · ');
+    const accountUrl =
+      plan.id === 'tokendance' && plan.websiteUrl
+        ? portalCreditsUrl(plan.websiteUrl)
+        : plan.websiteUrl;
+    const hasMenu = own || !!plan.subscribeUrls;
+    return (
+      <>
+        {/* Account: identity, status and region; key, priority; vendor console and actions. */}
+        <div className="flex flex-wrap items-start justify-between gap-3 border-b pb-4 @xl:flex-nowrap">
+          <div className="flex min-w-0 items-start gap-2.5">
+            <PresetLogo preset={plan} size="lg" />
+            <div className="min-w-0">
+              <div className="flex flex-wrap items-center gap-1">
+                <h4 className="break-words text-base font-semibold leading-6">{name}</h4>
+                {plan.name !== name && (
+                  <span className="text-xs text-muted-foreground">{plan.name}</span>
+                )}
+                <span
+                  className={cn(
+                    pill,
+                    provider
+                      ? 'gap-1 border-green-200 bg-green-50 text-green-700 dark:border-green-900 dark:bg-green-950/40 dark:text-green-300'
+                      : 'border-transparent bg-muted text-muted-foreground',
+                  )}
+                >
+                  {provider && (
+                    <span className="size-1.5 rounded-full bg-green-600" aria-hidden="true" />
+                  )}
+                  {t(provider ? `${tp}.statusConnected` : `${tp}.statusNotConnected`)}
+                </span>
+                <span className={cn(pill, 'border-transparent bg-muted text-muted-foreground')}>
+                  {regionLabel}
+                </span>
               </div>
-            ))}
+              <div className="flex flex-wrap items-center gap-x-2 text-xs leading-5 text-muted-foreground">
+                {provider?.source === 'deployment' && (
+                  <span>{t('settings.serverConfig.planServer')}</span>
+                )}
+                {own && provider?.key?.mask && (
+                  <span>
+                    {t(`${tp}.keyLabel`)}{' '}
+                    <span className="rounded bg-muted px-1 font-mono">{provider.key.mask}</span>
+                  </span>
+                )}
+                {own && provider?.key?.mask && <span aria-hidden="true">·</span>}
+                {provider && <span>{t(`${tp}.priority`, { n: rankOf(plan) })}</span>}
+                {!provider && <span>{t(`${tp}.connectHint`, { name })}</span>}
+              </div>
+            </div>
+          </div>
+          <div className="ml-auto flex shrink-0 flex-wrap items-center gap-1.5">
+            {own && (
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="h-8 text-xs"
+                onClick={() => {
+                  setEditingKey(!editingKey);
+                  setApiKey('');
+                }}
+              >
+                <KeyRound className="size-3.5" />
+                {t(editingKey ? `${tp}.cancelKeyUpdate` : `${tp}.updateKey`)}
+              </Button>
+            )}
+            {plan.websiteUrl && (
+              <a
+                href={plan.websiteUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className={linkButton}
+              >
+                {t(
+                  plan.consoleKind === 'portal'
+                    ? `${tp}.portalLink`
+                    : plan.consoleKind === 'platform'
+                      ? `${tp}.platformLink`
+                      : `${tp}.consoleLink`,
+                  { name },
+                )}
+                <ExternalLink className="size-3" aria-hidden="true" />
+              </a>
+            )}
+            {hasMenu && (
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="size-7"
+                    aria-label={t(`${tp}.more`)}
+                  >
+                    <MoreHorizontal className="size-4" />
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end">
+                  {/* A plan with subscription pages per site (Kimi): both stay reachable. */}
+                  {plan.subscribeUrls &&
+                    (
+                      [
+                        ['domestic', plan.subscribeUrls.domestic],
+                        ['international', plan.subscribeUrls.international],
+                      ] as const
+                    ).map(([side, url]) => (
+                      <DropdownMenuItem key={side} asChild>
+                        <a href={url} target="_blank" rel="noopener noreferrer">
+                          <ExternalLink className="size-4" />
+                          {t(`${tp}.subscribeOn`, { site: t(`settings.providerLinks.${side}`) })}
+                        </a>
+                      </DropdownMenuItem>
+                    ))}
+                  {own && (
+                    <DropdownMenuItem onSelect={() => setDisconnectOpen(true)}>
+                      <Unlink className="size-4" />
+                      {t(`${tp}.disconnect`)}
+                    </DropdownMenuItem>
+                  )}
+                </DropdownMenuContent>
+              </DropdownMenu>
+            )}
           </div>
         </div>
 
-        <div className="min-w-0 border-l pl-6">
-          {!selected ? (
-            <div className="py-8 text-sm text-muted-foreground">
-              {t('settings.tokenPlan.selectPlan')}
+        {own && editingKey && (
+          <div className="rounded-xl border bg-muted/20 p-4">{keyForm(plan, true)}</div>
+        )}
+
+        {!provider && !canConnect && <ServerOnlyNotice noUserKeys={!view.allowUserKeys} />}
+        {canConnect && (
+          <section className="space-y-3 rounded-xl border bg-muted/20 p-4">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <h5 className="text-sm font-medium">{t(`${tp}.connectTitle`, { name })}</h5>
+              <CredentialStorageHint />
             </div>
-          ) : (
-            <div className="space-y-5">
-              <div className="flex items-center justify-between gap-4 border-b pb-3">
-                <div className="min-w-0">
-                  <div className="truncate text-sm font-semibold">{selected.name}</div>
+            {keyForm(plan, false)}
+          </section>
+        )}
+
+        {provider && own && provider.key?.set && (
+          <PlanQuotaCard
+            name={name}
+            entry={quotas.entries[provider.id]}
+            onRefresh={() => void quotas.refresh(provider.id)}
+            accountUrl={accountUrl}
+          />
+        )}
+
+        <PlanCapabilities
+          view={view}
+          plan={plan}
+          provider={provider}
+          name={name}
+          serviceName={serviceName}
+        />
+
+        {/* Models & default routing: the plan's default per capability and
+            stage, and the models it offers; changed on the generation bar and
+            in Course Model Config. */}
+        <details className="group rounded-xl border bg-muted/40">
+          <summary className="flex cursor-pointer list-none items-center justify-between gap-2 rounded-xl px-4 py-2.5 text-sm font-medium outline-none focus-visible:ring-2 focus-visible:ring-ring">
+            <span className="flex items-center gap-2">
+              <Layers className="size-4 text-muted-foreground" aria-hidden="true" />
+              {t(`${tp}.modelsRouting`)}
+              <span className="text-xs font-normal text-muted-foreground">
+                · {t(`${tp}.modelsCount`, { n: modelCount })}
+              </span>
+            </span>
+            <ChevronDown className="size-4 shrink-0 transition-transform motion-reduce:transition-none group-open:rotate-180" />
+          </summary>
+          <div className="space-y-4 border-t px-4 py-3">
+            <dl className="space-y-1.5 text-xs leading-5">
+              {modelPlanItems(plan, offered).map((item) => (
+                <div
+                  key={`${item.capability}:${item.stageId ?? ''}`}
+                  className="flex justify-between gap-4"
+                >
+                  <dt className="text-muted-foreground">
+                    {t(MODEL_PLAN_CAPABILITY_LABEL_KEYS[item.capability])}
+                    {item.stageId
+                      ? ` · ${
+                          MODEL_PLAN_STAGE_LABEL_KEYS[item.stageId]
+                            ? t(MODEL_PLAN_STAGE_LABEL_KEYS[item.stageId])
+                            : item.stageId
+                        }`
+                      : ''}
+                  </dt>
+                  <dd className="break-all text-right font-mono">
+                    {item.model ?? t(`${tp}.planUnavailable`)}
+                  </dd>
                 </div>
-              </div>
-
-              <div className="space-y-2">
-                <Label className="text-sm">{t('settings.tokenPlan.apiKey')}</Label>
-                <div className="flex gap-2">
-                  <div className="relative flex-1">
-                    <Input
-                      type={showKey ? 'text' : 'password'}
-                      autoComplete="new-password"
-                      placeholder={selected.apiKeyPlaceholder ?? 'sk-...'}
-                      value={apiKey}
-                      onChange={(e) => setApiKey(e.target.value)}
-                      className="h-8 pr-8"
-                    />
-                    <button
-                      type="button"
-                      onClick={() => setShowKey(!showKey)}
-                      className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
-                    >
-                      {showKey ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
-                    </button>
-                  </div>
-                  {(() => {
-                    const enabled = isPresetEnabled(selected);
-                    const savedKey = presetSavedKey(selected);
-                    const trimmedKey = apiKey.trim();
-                    const updatingKey = enabled && trimmedKey.length > 0 && trimmedKey !== savedKey;
-                    return (
-                      <div className="flex items-center gap-2">
-                        {updatingKey && (
-                          <Button onClick={handleApply} size="sm" className="h-8 gap-1.5">
-                            <Zap className="h-3.5 w-3.5" />
-                            {t('settings.tokenPlan.updateKey')}
-                          </Button>
-                        )}
-                        <div className="flex h-8 items-center gap-2 rounded-md border px-2">
-                          <span className="text-xs text-muted-foreground">
-                            {t('settings.tokenPlan.enable')}
-                          </span>
-                          <Switch
-                            checked={enabled}
-                            disabled={!enabled && !trimmedKey}
-                            onCheckedChange={(checked) => {
-                              if (checked) {
-                                handleApply();
-                              } else {
-                                disablePreset(selected);
-                              }
-                            }}
-                            aria-label={t('settings.tokenPlan.enable')}
-                          />
-                        </div>
-                      </div>
-                    );
-                  })()}
-                </div>
-              </div>
-
-              {/* Capabilities: a display-only tab list of the models the plan
-                  offers per modality. No status, no probing — selection and
-                  enable/disable happen on the generation bar. */}
-              <div className="space-y-3">
-                <div className="text-sm font-medium">{t('settings.tokenPlan.capabilities')}</div>
-
-                {/* Tab bar (segmented control) */}
-                <div className="flex gap-0.5 rounded-lg bg-muted/60 p-0.5">
-                  {presetModalities(selected).map((m) => {
-                    const Icon = MODALITY_ICONS[m];
-                    const isActive = activeTab === m;
-                    return (
-                      <button
-                        key={m}
-                        onClick={() => setActiveTab(m)}
-                        className={cn(
-                          'relative flex flex-1 items-center justify-center gap-1.5 rounded-md py-1.5 text-[11px] font-medium transition-all',
-                          isActive
-                            ? 'bg-background text-foreground shadow-sm'
-                            : 'text-muted-foreground hover:text-foreground/80',
-                        )}
-                      >
-                        <Icon className="size-3.5" />
-                        <span className="hidden truncate sm:inline">
-                          {t(MODALITY_LABEL_KEYS[m])}
-                        </span>
-                      </button>
-                    );
-                  })}
-                </div>
-
-                {/* Tab content: static model list for the active modality */}
-                {(() => {
-                  const models = modalityModels(selected, activeTab);
-                  return (
-                    <div className="space-y-2 rounded-md border p-3">
-                      <div className="flex items-center justify-between gap-3 text-xs">
-                        <span className="font-medium">{t(MODALITY_LABEL_KEYS[activeTab])}</span>
-                        <span className="text-muted-foreground">
-                          {t('settings.tokenPlan.modelsCount', { n: models.length })}
-                        </span>
-                      </div>
-                      <ul className="space-y-1">
-                        {models.map((id) => (
-                          <li
-                            key={id}
-                            className="flex items-center gap-2 text-xs text-muted-foreground"
-                          >
-                            <span className="size-1 shrink-0 rounded-full bg-muted-foreground/40" />
-                            <span className="truncate font-mono">{id}</span>
-                          </li>
-                        ))}
-                      </ul>
+              ))}
+            </dl>
+            <div className="grid gap-3 sm:grid-cols-2">
+              {modalities
+                .filter((m) => planModels(plan, m).length > 0)
+                .map((m) => (
+                  <div key={m} className="space-y-1">
+                    <div className="flex items-center justify-between text-xs">
+                      <span className="font-medium">{t(MODEL_PLAN_CAPABILITY_LABEL_KEYS[m])}</span>
+                      <span className="text-muted-foreground">
+                        {t(`${tp}.modelsCount`, { n: planModels(plan, m).length })}
+                      </span>
                     </div>
-                  );
-                })()}
+                    <ul className="space-y-0.5">
+                      {planModels(plan, m).map((id) => (
+                        <li key={id} className="truncate font-mono text-xs text-muted-foreground">
+                          {id}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                ))}
+            </div>
+            <div className="space-y-1 text-[11px] leading-relaxed text-muted-foreground">
+              <p>{t(`${tp}.offeredNote`)}</p>
+              <p>{t(`${tp}.planNoteEntitlement`)}</p>
+              <p>{t(`${tp}.planNoteEditable`)}</p>
+            </div>
+          </div>
+        </details>
+      </>
+    );
+  };
 
-                <p className="text-[11px] leading-relaxed text-muted-foreground">
-                  {t('settings.tokenPlan.offeredNote')}
-                </p>
+  // Each side lists the plans its accounts can use.
+  const regionSwitch = (
+    <div className="flex items-center justify-end gap-2">
+      <span
+        id="token-plan-region-label"
+        className="flex items-center gap-1 text-xs text-muted-foreground"
+      >
+        <Globe className="size-3.5" aria-hidden="true" />
+        <span className="max-lg:sr-only">{t(`${tp}.region`)}</span>
+      </span>
+      <div
+        className="flex gap-0.5 rounded-lg bg-muted/60 p-0.5"
+        role="group"
+        aria-labelledby="token-plan-region-label"
+      >
+        {REGIONS.map((side) => (
+          <button
+            key={side}
+            type="button"
+            aria-pressed={region === side}
+            onClick={() => selectRegion(side)}
+            className={cn(
+              'rounded-md px-3 py-1 text-xs font-medium outline-none transition-all focus-visible:ring-2 focus-visible:ring-ring',
+              region === side
+                ? 'bg-background text-foreground shadow-sm'
+                : 'text-muted-foreground hover:text-foreground/80',
+            )}
+          >
+            {t(`settings.providerLinks.${side}`)}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+
+  return (
+    <div className="flex flex-col gap-4">
+      {/* The region switch sits in the dialog's header when it hosts one. */}
+      {regionSlot ? createPortal(regionSwitch, regionSlot) : regionSwitch}
+
+      <div className="grid gap-4 lg:grid-cols-[16rem_minmax(0,1fr)]">
+        {/* Plans: connected in priority order, then the ones to set up. */}
+        <div
+          className="flex min-w-0 flex-col gap-4 rounded-xl bg-muted/30 p-1"
+          role="tablist"
+          aria-label={t(`${tp}.selectPlan`)}
+          aria-orientation="vertical"
+        >
+          {connected.length > 0 && (
+            <div className="space-y-1">
+              <div className="flex items-center justify-between px-2 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+                <span>{t(`${tp}.connectedCount`, { n: connected.length })}</span>
+                <span className="normal-case tracking-normal">{t(`${tp}.priorityOrder`)}</span>
               </div>
+              {connected.map((plan) => planRow(plan, plans.indexOf(plan)))}
             </div>
           )}
+          {available.length > 0 && (
+            <div className="space-y-1">
+              <div className="px-2 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+                {t(`${tp}.availableCount`, { n: available.length })}
+              </div>
+              {available.map((plan) => planRow(plan, plans.indexOf(plan)))}
+            </div>
+          )}
+          <div className="mt-auto border-t px-2 pt-3 text-xs leading-snug text-muted-foreground">
+            <p>
+              {t(
+                region === 'domestic'
+                  ? `${tp}.regionHintDomestic`
+                  : `${tp}.regionHintInternational`,
+              )}{' '}
+              {t(`${tp}.priorityNote`)}
+            </p>
+          </div>
         </div>
+
+        {selected && (
+          <div className="@container min-w-0 space-y-4" role="tabpanel">
+            {detail(selected)}
+          </div>
+        )}
       </div>
+
+      {/* Connecting would replace models the workspace picked: ask first. */}
+      {pending && (
+        <AlertDialog
+          open
+          onOpenChange={(open) => {
+            if (!open) setPending(null);
+          }}
+        >
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>{t(`${tp}.applyTitle`)}</AlertDialogTitle>
+              <AlertDialogDescription>
+                {t(`${tp}.applyBody`, { name: presetDisplayName(pending.plan) })}
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <ul className="max-h-60 space-y-1.5 overflow-y-auto text-xs leading-5">
+              {pending.conflicts.map((conflict) => {
+                const preset = presetOf(pending.plan);
+                const current =
+                  conflict.current === null
+                    ? null
+                    : typeof conflict.current === 'string'
+                      ? conflict.current
+                      : conflict.current.model;
+                return (
+                  <li key={conflict.slot.slot} className="flex flex-wrap items-baseline gap-x-2">
+                    <span className="font-medium">{slotName(t, conflict.slot.slot)}</span>
+                    <span className="min-w-0 break-all text-muted-foreground">
+                      {assignmentLabel(conflict, current, preset)}
+                      {conflict.from === 'default' && ` (${t(`${MS}.source.default`)})`}
+                      {' → '}
+                      <span className="text-foreground">
+                        {assignmentLabel(conflict, conflict.recommended, preset)}
+                      </span>
+                    </span>
+                  </li>
+                );
+              })}
+            </ul>
+            <AlertDialogFooter>
+              <AlertDialogAction variant="outline" onClick={() => choose('keep')}>
+                {t(`${tp}.applyKeep`)}
+              </AlertDialogAction>
+              <AlertDialogAction onClick={() => choose('overwrite')}>
+                {t(`${tp}.applyRecommended`)}
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
+      )}
+
+      {/* 解除连接确认 */}
+      {selected && (
+        <AlertDialog open={disconnectOpen} onOpenChange={setDisconnectOpen}>
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>{t(`${tp}.disconnectTitle`)}</AlertDialogTitle>
+              <AlertDialogDescription>{t(`${tp}.disconnectBody`)}</AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel>{t('common.cancel')}</AlertDialogCancel>
+              <AlertDialogAction onClick={() => void disconnect(selected)}>
+                {t(`${tp}.disconnect`)}
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
+      )}
     </div>
   );
 }

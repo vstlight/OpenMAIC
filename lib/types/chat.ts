@@ -1,3 +1,4 @@
+import type { InteractiveStateEvidence } from '@/lib/interactive/chat-observation';
 /**
  * Shared Type Definitions for Multi-Agent Orchestration
  *
@@ -320,7 +321,17 @@ export interface InteractiveComponentReference {
   selector: string;
 }
 
-export type ElementReference = SlideElementReference | InteractiveComponentReference;
+/** Identity only; content is resolved from this request's Stage snapshot. */
+export interface WhiteboardElementReference {
+  kind: 'whiteboard_element';
+  whiteboardId: string;
+  elementId: string;
+}
+
+export type ElementReference =
+  | SlideElementReference
+  | InteractiveComponentReference
+  | WhiteboardElementReference;
 
 /**
  * Request body for the stateless chat API
@@ -362,6 +373,8 @@ export interface StatelessChatRequest {
   };
   /** Optional Pi-only, identity-only reference to one classroom component. */
   elementReference?: ElementReference;
+  /** Request-scoped browser evidence, never a tool permission or static definition. */
+  interactiveState?: InteractiveStateEvidence;
   /** Agent configuration */
   config: {
     agentIds: string[];
@@ -385,10 +398,6 @@ export interface StatelessChatRequest {
       isGenerated?: boolean;
       boundStageId?: string;
     }>;
-    /** Pi PoC: max child agent turns in one server-side loop. */
-    piMaxAgentTurns?: number;
-    /** Pi PoC: max emitted actions per child agent turn. */
-    piMaxActionsPerAgent?: number;
     /** Pi PoC: opt in to whiteboard tools; defaults off to keep the first A/B pass comparable. */
     piEnableWhiteboardTools?: boolean;
   };
@@ -479,13 +488,15 @@ export type StatelessEvent =
           }
         | { kind: 'projection'; stageId: string; lastSeq: number };
     }
-  | { type: 'cue_user'; data: { fromAgentId?: string; prompt?: string } }
+  | { type: 'cue_user'; data: { fromAgentId?: string; prompt?: string; options?: string[] } }
   | {
       type: 'done';
       data: {
         totalActions: number;
         totalAgents: number;
         agentHadContent?: boolean;
+        /** A teacher or assistant call this request failed or produced nothing visible. */
+        teachingAgentFailedOrEmpty?: boolean;
         cueUserReceived?: boolean;
         sessionClosed?: boolean;
         endReason?: string;

@@ -23,7 +23,6 @@ import {
   FetchUrlError,
   normalizeUntrustedText,
 } from '@/lib/server/agent-runtime/fetch-url';
-import * as providerConfig from '@/lib/server/provider-config';
 import { normalizeUrlForStrictFetch } from '@/lib/server/ssrf-guard';
 
 const dispatcher = {} as never;
@@ -168,7 +167,6 @@ describe('fetch_url network and extraction', () => {
   });
 
   it('selects configured self-hosted MinerU for PDF extraction', async () => {
-    vi.spyOn(providerConfig, 'getServerPDFProviders').mockReturnValue({ mineru: {} });
     const mineru = getDocumentExtractorProvider('mineru')!;
     const unpdf = getDocumentExtractorProvider('unpdf')!;
     const mineruExtract = vi
@@ -185,6 +183,16 @@ describe('fetch_url network and extraction', () => {
       fetchImpl,
       dispatcher,
       minChars: 20,
+      // The document slot's service: self-hosted MinerU.
+      extractionServices: {
+        document: {
+          providerId: 'mineru',
+          baseUrl: 'http://mineru.internal:8000',
+          managed: true,
+          userEndpoint: false,
+          origin: 'configuration',
+        },
+      },
     });
 
     expect(result.markdown).toContain('MinerU 正文');
@@ -195,7 +203,6 @@ describe('fetch_url network and extraction', () => {
   });
 
   it('falls back to unpdf when no managed PDF provider is configured', async () => {
-    vi.spyOn(providerConfig, 'getServerPDFProviders').mockReturnValue({});
     const unpdf = getDocumentExtractorProvider('unpdf')!;
     const unpdfExtract = vi
       .spyOn(unpdf, 'extract')
@@ -210,6 +217,7 @@ describe('fetch_url network and extraction', () => {
       fetchImpl,
       dispatcher,
       minChars: 20,
+      extractionServices: { document: null },
     });
 
     expect(result.markdown).toContain('unpdf 正文');
@@ -220,8 +228,41 @@ describe('fetch_url network and extraction', () => {
     );
   });
 
+  it('resolves the document service lazily, only when the page is a PDF', async () => {
+    const unpdf = getDocumentExtractorProvider('unpdf')!;
+    vi.spyOn(unpdf, 'extract').mockResolvedValue(pdfArtifact('unpdf', 'PDF text. '.repeat(50)));
+    const brokenDocumentSlot = vi.fn(async () => {
+      throw new Error('document slot misconfigured');
+    });
+    const html = `<html><head><title>Page</title></head><body><article><p>${'Plain paragraph text. '.repeat(30)}</p></article></body></html>`;
+
+    const page = await fetchAndExtractUrl('https://example.com/page', {
+      fetchImpl: vi
+        .fn()
+        .mockResolvedValue(new Response(html, { headers: { 'content-type': 'text/html' } })),
+      dispatcher,
+      minChars: 20,
+      loadExtractionServices: brokenDocumentSlot,
+    });
+    expect(page.markdown).toContain('Plain paragraph text.');
+    expect(brokenDocumentSlot).not.toHaveBeenCalled();
+
+    const loadExtractionServices = vi.fn(async () => ({ document: null }));
+    const pdf = await fetchAndExtractUrl('https://example.com/document.pdf', {
+      fetchImpl: vi.fn().mockResolvedValue(
+        new Response((await pdfBytes()) as unknown as BodyInit, {
+          headers: { 'content-type': 'application/pdf' },
+        }),
+      ),
+      dispatcher,
+      minChars: 20,
+      loadExtractionServices,
+    });
+    expect(pdf.markdown).toContain('PDF text.');
+    expect(loadExtractionServices).toHaveBeenCalledOnce();
+  });
+
   it('limits untrusted PDFs to 50 pages before extraction', async () => {
-    vi.spyOn(providerConfig, 'getServerPDFProviders').mockReturnValue({});
     const input = await pdfBytes(51);
     const unpdf = getDocumentExtractorProvider('unpdf')!;
     const unpdfExtract = vi.spyOn(unpdf, 'extract').mockImplementation(async ({ buffer }) => {
@@ -246,7 +287,6 @@ describe('fetch_url network and extraction', () => {
   });
 
   it('caps extracted PDF text independently of the download size', async () => {
-    vi.spyOn(providerConfig, 'getServerPDFProviders').mockReturnValue({});
     const unpdf = getDocumentExtractorProvider('unpdf')!;
     vi.spyOn(unpdf, 'extract').mockResolvedValue(pdfArtifact('unpdf', 'x'.repeat(1_200_000)));
     const fetchImpl = vi.fn().mockResolvedValue(

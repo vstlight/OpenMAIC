@@ -1,26 +1,39 @@
-import { beforeAll, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import type { Browser } from 'puppeteer-core';
 import { PreviewGate } from '../src/preview-gate.js';
-import { PreviewTimeoutError, type PreviewRenderer } from '../src/preview-renderer.js';
+import {
+  ChromiumPreviewRenderer,
+  PreviewTimeoutError,
+  type PreviewRenderer,
+} from '../src/preview-renderer.js';
 import {
   MAX_INTERACTIVE_HTML_DEPTH,
   MAX_INTERACTIVE_HTML_ELEMENTS,
 } from '../src/preview-validation.js';
 import type { RenderExecutor } from '../src/render-executor.js';
 import { Semaphore } from '../src/semaphore.js';
+import { waitUntil } from './support/async.js';
 import {
   createMemoryArtifactStore,
   createMemoryJobStore,
   succeedingExecutor,
 } from './support/fakes.js';
+import { submitRender } from './support/identities.js';
 
 process.env.RENDER_SERVICE_NO_LISTEN = 'true';
 
+type AppDeps = import('../src/main.js').AppDeps;
 let createApp: typeof import('../src/main.js').createApp;
 let RenderCoordinator: typeof import('../src/render-coordinator.js').RenderCoordinator;
 
 beforeAll(async () => {
   ({ createApp } = await import('../src/main.js'));
   ({ RenderCoordinator } = await import('../src/render-coordinator.js'));
+});
+
+afterEach(() => {
+  vi.unstubAllEnvs();
+  vi.useRealTimers();
 });
 
 function previewPayload() {
@@ -54,8 +67,12 @@ function previewPayload() {
   } as const;
 }
 
-function previewRequest(payload: unknown = previewPayload(), identity = 'preview-user'): Request {
-  return new Request('http://test/preview', {
+function previewRequest(
+  payload: unknown = previewPayload(),
+  identity = 'preview-user',
+  path = '/preview',
+): Request {
+  return new Request(new URL(path, 'https://example.com'), {
     method: 'POST',
     headers: { 'content-type': 'application/json', 'x-openmaic-client': identity },
     body: JSON.stringify(payload),
@@ -83,8 +100,13 @@ function appWith(
   previewGate = new PreviewGate(8, 2),
   options: {
     extractionGate?: Semaphore;
+    previewExecutionGate?: Semaphore;
     previewDeadlineMs?: number;
     previewMaxJsonBytes?: number;
+    resourceMode?: boolean;
+    interactiveRuntimeCheck?: AppDeps['interactiveRuntimeCheck'];
+    interactiveRuntimeWaitMs?: number;
+    onEvent?: AppDeps['onEvent'];
   } = {},
 ) {
   const jobs = createMemoryJobStore();
@@ -95,14 +117,282 @@ function appWith(
     artifacts,
     coordinator,
     extractionGate: options.extractionGate ?? new Semaphore(1),
+    previewExecutionGate: options.previewExecutionGate,
     previewGate,
     previewRenderer,
+    interactiveRuntimeCheck: options.interactiveRuntimeCheck,
+    interactiveRuntimeWaitMs: options.interactiveRuntimeWaitMs,
     previewDeadlineMs: options.previewDeadlineMs,
     previewMaxJsonBytes: options.previewMaxJsonBytes,
+    resourceMode: options.resourceMode,
+    onEvent: options.onEvent,
   });
 }
 
+describe('POST /interactive-runtime-check', () => {
+  const path = '/interactive-runtime-check';
+
+  function runtimeRequest(html = '<!doctype html><p>Widget</p>', endpoint = path) {
+    const base = previewPayload();
+    return previewRequest(
+      {
+        ...base,
+        scene: {
+          ...base.scene,
+          type: 'interactive',
+          content: { type: 'interactive', html },
+          actions: [{ id: 'reveal', type: 'widget_reveal', target: '#part' }],
+        },
+      },
+      'check-user',
+      endpoint,
+    );
+  }
+
+  it('accepts raw hosted library references only for runtime checks', async () => {
+    const html = '<script src="/vendor/interactive/chart.js@4.4.8/dist/chart.umd.js"></script>';
+    const interactiveRuntimeCheck = vi.fn<NonNullable<AppDeps['interactiveRuntimeCheck']>>(
+      async () => [],
+    );
+    const render = vi.fn<PreviewRenderer['render']>();
+    const app = appWith({ render }, undefined, { interactiveRuntimeCheck });
+
+    expect((await app.fetch(runtimeRequest(html))).status).toBe(200);
+    expect(interactiveRuntimeCheck.mock.calls[0]?.[0].scene.content.html).toBe(html);
+    expect((await app.fetch(runtimeRequest(html, '/preview'))).status).toBe(422);
+    expect(render).not.toHaveBeenCalled();
+
+    const external = '<script src="https://unrelated.example.test/lib.js"></script>';
+    expect((await app.fetch(runtimeRequest(external))).status).toBe(422);
+    expect(interactiveRuntimeCheck).toHaveBeenCalledOnce();
+  });
+
+  it('rewrites compatible CDN references before validating runtime checks', async () => {
+    const html = '<script src="//unpkg.com/katex@0.16.9/dist/katex.min.js"></script>';
+    const interactiveRuntimeCheck = vi.fn<NonNullable<AppDeps['interactiveRuntimeCheck']>>(
+      async () => [],
+    );
+    const app = appWith({ render: vi.fn() }, undefined, { interactiveRuntimeCheck });
+
+    expect((await app.fetch(runtimeRequest(html))).status).toBe(200);
+    expect(interactiveRuntimeCheck.mock.calls[0]?.[0].scene.content.html).toBe(
+      '<script src="/vendor/interactive/katex@0.16.38/dist/katex.min.js"></script>',
+    );
+  });
+
+  it('returns JSON and shares the PNG preview execution gate', async () => {
+    const pending =
+      deferred<Awaited<ReturnType<NonNullable<AppDeps['interactiveRuntimeCheck']>>>>();
+    const interactiveRuntimeCheck = vi.fn<NonNullable<AppDeps['interactiveRuntimeCheck']>>(
+      () => pending.promise,
+    );
+    const render = vi.fn<PreviewRenderer['render']>();
+    const onEvent = vi.fn();
+    const app = appWith({ render }, undefined, {
+      interactiveRuntimeCheck,
+      previewExecutionGate: new Semaphore(1),
+      onEvent,
+    });
+    const check = app.fetch(runtimeRequest());
+    try {
+      await waitFor(() => interactiveRuntimeCheck.mock.calls.length === 1);
+      const preview = await app.fetch(previewRequest());
+      expect(preview.status).toBe(429);
+      expect(render).not.toHaveBeenCalled();
+    } finally {
+      pending.resolve([
+        { phase: 'action', actionIndex: 0, actionType: 'REVEAL_ELEMENT', message: 'Missing part' },
+      ]);
+    }
+    const response = await check;
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({ errors: await pending.promise });
+    const request = interactiveRuntimeCheck.mock.calls[0]?.[0];
+    expect(request?.scene.actions).toHaveLength(1);
+    expect(request?.deadlineMs).toBeLessThanOrEqual(5_000);
+    expect(onEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event: 'preview_request',
+        route: path,
+        runtimeCheckResult: 'checked',
+      }),
+    );
+  });
+
+  function setupWaitingCheck(previewDeadlineMs = 5_000) {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
+    const previewExecutionGate = new Semaphore(1);
+    const release = previewExecutionGate.tryAcquire()!;
+    const waitForExecution = vi.spyOn(previewExecutionGate, 'run');
+    const interactiveRuntimeCheck = vi.fn<NonNullable<AppDeps['interactiveRuntimeCheck']>>(
+      async () => [],
+    );
+    const onEvent = vi.fn();
+    const app = appWith({ render: vi.fn() }, undefined, {
+      previewExecutionGate,
+      interactiveRuntimeCheck,
+      interactiveRuntimeWaitMs: 2_000,
+      previewDeadlineMs,
+      onEvent,
+    });
+    const abort = new AbortController();
+    const check = app.fetch(new Request(runtimeRequest(), { signal: abort.signal }));
+    return {
+      check,
+      release,
+      abort,
+      previewExecutionGate,
+      waitForExecution,
+      interactiveRuntimeCheck,
+      onEvent,
+    };
+  }
+
+  it('waits for a slot and runs with the remaining deadline', async () => {
+    const { check, release, waitForExecution, interactiveRuntimeCheck } = setupWaitingCheck();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(waitForExecution).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(1_500);
+    expect(interactiveRuntimeCheck).not.toHaveBeenCalled();
+
+    release();
+    const response = await check;
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({ errors: [] });
+    expect(interactiveRuntimeCheck).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ deadlineMs: 3_500 }),
+    );
+  });
+
+  it.each([
+    { result: 'busy_timeout', deadline: 5_000, elapsed: 2_000, status: 429 },
+    { result: 'deadline', deadline: 1_000, elapsed: 1_000, status: 504 },
+    { result: 'aborted', deadline: 5_000, elapsed: 500, status: 500 },
+  ])('removes the waiter on $result without releasing the held slot', async (test) => {
+    const {
+      check,
+      release,
+      abort,
+      previewExecutionGate,
+      waitForExecution,
+      interactiveRuntimeCheck,
+      onEvent,
+    } = setupWaitingCheck(test.deadline);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(waitForExecution).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(test.elapsed);
+    if (test.result === 'aborted') abort.abort();
+
+    const response = await check;
+    expect(response.status).toBe(test.status);
+    if (test.result === 'busy_timeout') {
+      await expect(response.json()).resolves.toMatchObject({ reason: 'capacity_busy' });
+    }
+    expect(previewExecutionGate.tryAcquire()).toBeUndefined();
+    release();
+    const nextRelease = previewExecutionGate.tryAcquire();
+    expect(nextRelease).toBeTypeOf('function');
+    expect(previewExecutionGate.tryAcquire()).toBeUndefined();
+    nextRelease?.();
+    expect(interactiveRuntimeCheck).not.toHaveBeenCalled();
+    expect(onEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event: 'preview_request',
+        route: path,
+        runtimeCheckResult: test.result,
+      }),
+    );
+  });
+
+  it('rejects non-interactive scenes and maps an expired check to HTTP 504', async () => {
+    const interactiveRuntimeCheck: NonNullable<AppDeps['interactiveRuntimeCheck']> = ({ signal }) =>
+      new Promise((_resolve, reject) =>
+        signal.addEventListener('abort', () => reject(signal.reason), { once: true }),
+      );
+    const app = appWith({ render: vi.fn() }, undefined, {
+      interactiveRuntimeCheck,
+      previewDeadlineMs: 100,
+    });
+    expect((await app.fetch(previewRequest(previewPayload(), 'check-user', path))).status).toBe(
+      400,
+    );
+    expect((await app.fetch(runtimeRequest())).status).toBe(504);
+  });
+});
+
 describe('POST /preview', () => {
+  it.each(['disconnect', 'deadline'])(
+    'holds execution capacity through a %s during Chromium launch and its cleanup',
+    async (reason) => {
+      vi.stubEnv('PRODUCER_HEADLESS_SHELL_PATH', '/test/chromium');
+      const launching = deferred<Browser>();
+      const closing = deferred();
+      const kill = vi.fn();
+      const close = vi.fn(() => closing.promise);
+      const browser = { close, process: () => ({ kill }) } as unknown as Browser;
+      const launch = vi
+        .fn<() => Promise<Browser>>()
+        .mockImplementationOnce(() => launching.promise)
+        .mockRejectedValue(new Error('unexpected parallel Chromium launch'));
+      const renderer = new ChromiumPreviewRenderer({ browserLauncher: { launch } });
+      const app = appWith(renderer, new PreviewGate(8, 0), { previewDeadlineMs: 60_000 });
+      const abort = new AbortController();
+      const first = app.fetch(new Request(previewRequest(), { signal: abort.signal }));
+
+      try {
+        await waitFor(() => launch.mock.calls.length === 1);
+        abort.abort(
+          reason === 'deadline'
+            ? new PreviewTimeoutError('Preview exceeded the deadline')
+            : new Error('client disconnected'),
+        );
+        // Let the abort unwind before submitting the burst. No browser has returned yet.
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        for (let i = 0; i < 3; i += 1) {
+          const rejected = await app.fetch(previewRequest(previewPayload(), `burst-${i}`));
+          expect(rejected.status).toBe(429);
+          await expect(rejected.json()).resolves.toMatchObject({ reason: 'capacity_busy' });
+        }
+        expect(launch).toHaveBeenCalledOnce();
+
+        launching.resolve(browser);
+        await waitFor(() => close.mock.calls.length === 1);
+        const duringCleanup = await app.fetch(previewRequest());
+        expect(duringCleanup.status).toBe(429);
+        await expect(duringCleanup.json()).resolves.toMatchObject({ reason: 'capacity_busy' });
+        expect(kill).toHaveBeenCalledWith('SIGKILL');
+      } finally {
+        launching.resolve(browser);
+        closing.resolve();
+        await first;
+      }
+      expect((await first).status).toBe(reason === 'deadline' ? 504 : 500);
+
+      // A later launch failure proves the slot became available after cleanup.
+      launch.mockRejectedValueOnce(new Error('next launch reached'));
+      const next = await app.fetch(previewRequest());
+      expect(next.status).toBe(500);
+      await expect(next.json()).resolves.toEqual({ error: 'next launch reached' });
+    },
+  );
+
+  it('rejects resource mode before parsing the request or starting Chromium', async () => {
+    const render = vi.fn<PreviewRenderer['render']>();
+    const response = await appWith({ render }, undefined, {
+      resourceMode: true,
+      // A normal route would reject this body as oversized first. Resource mode
+      // must win before even declared-length/body processing.
+      previewMaxJsonBytes: 1,
+    }).fetch(previewRequest());
+
+    expect(response.status).toBe(503);
+    await expect(response.json()).resolves.toEqual({
+      error: 'Preview is unavailable while per-task resource budgets are enabled',
+      reason: 'resource_mode_unsupported',
+    });
+    expect(render).not.toHaveBeenCalled();
+  });
+
   it('returns the rendered PNG synchronously', async () => {
     const render = vi.fn<PreviewRenderer['render']>(async () => new Uint8Array([137, 80, 78, 71]));
     const response = await appWith({ render }).fetch(previewRequest());
@@ -519,7 +809,7 @@ describe('POST /preview', () => {
     expect(renderCalls).toBe(1);
   });
 
-  it('fast-rejects when a video render holds the shared Chromium execution limit', async () => {
+  it('serves a preview while a video render holds the export execution slot', async () => {
     const videoStarted = deferred();
     const finishVideo = deferred();
     const executor: RenderExecutor = {
@@ -532,8 +822,9 @@ describe('POST /preview', () => {
     const jobs = createMemoryJobStore();
     const artifacts = createMemoryArtifactStore().store;
     const coordinator = new RenderCoordinator(executor, jobs, artifacts, { maxConcurrency: 1 });
-    const videoId = await coordinator.submit(
-      coordinator.reserve('video-user'),
+    const videoId = await submitRender(
+      coordinator,
+      'video-user',
       '/tmp/openmaic-preview-route-video-test',
       { fps: 30, quality: 'standard', format: 'mp4' },
     );
@@ -548,22 +839,114 @@ describe('POST /preview', () => {
       previewRenderer: { render },
       previewDeadlineMs: 1_000,
     });
-    const started = Date.now();
-    const preview = await app.fetch(previewRequest());
-
-    expect(Date.now() - started).toBeLessThan(500);
-    expect(render).not.toHaveBeenCalled();
-    expect(preview.status).toBe(429);
-    await expect(preview.json()).resolves.toMatchObject({ reason: 'capacity_busy' });
-
-    finishVideo.resolve();
-    for (let attempt = 0; attempt < 100; attempt += 1) {
-      if ((await jobs.get(videoId))?.status === 'succeeded') break;
-      await new Promise((resolve) => setTimeout(resolve, 5));
+    try {
+      const preview = await app.fetch(previewRequest());
+      expect(preview.status).toBe(200);
+      expect(preview.headers.get('content-type')).toBe('image/png');
+      expect(new Uint8Array(await preview.arrayBuffer())).toEqual(new Uint8Array([1]));
+      expect((await jobs.get(videoId))?.status).toBe('running');
+    } finally {
+      finishVideo.resolve();
     }
-    expect((await jobs.get(videoId))?.status).toBe('succeeded');
+    await waitUntil(
+      async () => (await jobs.get(videoId))?.status === 'succeeded' || null,
+      'video completion',
+    );
+  });
+
+  it('starts an export while a preview burst saturates its own execution slot', async () => {
+    const previewStarted = deferred();
+    const finishPreview = deferred();
+    const finishVideo = deferred();
+    const jobs = createMemoryJobStore();
+    const artifacts = createMemoryArtifactStore().store;
+    const coordinator = new RenderCoordinator(
+      {
+        async execute() {
+          await finishVideo.promise;
+          return { status: 'succeeded' };
+        },
+      },
+      jobs,
+      artifacts,
+      { maxConcurrency: 1 },
+    );
+    const app = createApp({
+      jobs,
+      artifacts,
+      coordinator,
+      extractionGate: new Semaphore(1),
+      previewRenderer: {
+        async render() {
+          previewStarted.resolve();
+          await finishPreview.promise;
+          return new Uint8Array([1]);
+        },
+      },
+    });
+    const preview = app.fetch(previewRequest());
+    await previewStarted.promise;
+
+    try {
+      const burst = await Promise.all(
+        Array.from({ length: 4 }, (_, index) =>
+          app.fetch(previewRequest(previewPayload(), `burst-${index}`)),
+        ),
+      );
+      for (const response of burst) {
+        expect(response.status).toBe(429);
+        await expect(response.json()).resolves.toMatchObject({ reason: 'capacity_busy' });
+      }
+      const videoId = await submitRender(
+        coordinator,
+        'video-user',
+        '/tmp/openmaic-preview-burst-video-test',
+        { fps: 30, quality: 'standard', format: 'mp4' },
+      );
+      await waitUntil(
+        async () => (await jobs.get(videoId))?.status === 'running' || null,
+        'export to start while preview is running',
+      );
+    } finally {
+      finishPreview.resolve();
+      finishVideo.resolve();
+      expect((await preview).status).toBe(200);
+    }
+  });
+
+  it('uses the configured preview concurrency and fast-fails beyond it', async () => {
+    const finish = deferred();
+    let running = 0;
+    const app = appWith(
+      {
+        async render() {
+          running += 1;
+          try {
+            await finish.promise;
+            return new Uint8Array([1]);
+          } finally {
+            running -= 1;
+          }
+        },
+      },
+      undefined,
+      { previewExecutionGate: new Semaphore(2) },
+    );
+    const first = app.fetch(previewRequest(previewPayload(), 'first'));
+    const second = app.fetch(previewRequest(previewPayload(), 'second'));
+    try {
+      await waitFor(() => running === 2);
+      const rejected = await app.fetch(previewRequest(previewPayload(), 'third'));
+      expect(rejected.status).toBe(429);
+      await expect(rejected.json()).resolves.toMatchObject({ reason: 'capacity_busy' });
+      expect(running).toBe(2);
+    } finally {
+      finish.resolve();
+      await Promise.all([first, second]);
+    }
+    expect((await first).status).toBe(200);
+    expect((await second).status).toBe(200);
     expect((await app.fetch(previewRequest())).status).toBe(200);
-    expect(render).toHaveBeenCalledOnce();
   });
 
   it('aborts rendering and releases admission when the client disconnects', async () => {
@@ -591,4 +974,29 @@ describe('POST /preview', () => {
 
     expect((await app.fetch(previewRequest())).status).toBe(200);
   });
+
+  it.each(['failure', 'deadline'])(
+    'releases preview execution capacity after a renderer %s',
+    async (outcome) => {
+      let calls = 0;
+      const app = appWith(
+        {
+          async render({ signal }) {
+            calls += 1;
+            if (calls > 1) return new Uint8Array([1]);
+            if (outcome === 'failure') throw new Error('Chromium launch failed');
+            return new Promise<Uint8Array>((_resolve, reject) => {
+              signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+            });
+          },
+        },
+        new PreviewGate(1, 0),
+        { previewDeadlineMs: 20 },
+      );
+
+      const failed = await app.fetch(previewRequest());
+      expect(failed.status).toBe(outcome === 'deadline' ? 504 : 500);
+      expect((await app.fetch(previewRequest())).status).toBe(200);
+    },
+  );
 });

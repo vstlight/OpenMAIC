@@ -46,6 +46,7 @@ import type { LanguageModel } from 'ai';
 import { createLogger } from '@/lib/logger';
 import { streamLLM } from '@/lib/ai/llm';
 import { buildVisionUserContent } from '@openmaic/generation';
+import { prepareVisionImages } from '@/lib/server/generation/vision-images';
 import type { ThinkingConfig } from '@/lib/types/provider';
 
 import type {
@@ -56,6 +57,7 @@ import type {
   PBLProjectV2,
 } from '../types';
 import type { PBLSSEEvent } from '../api/sse';
+import { streamPBLParts } from '../api/llm-stream';
 import { addEvaluation } from '../operations/runtime/evaluation';
 import { latestSubmissionForMicrotask } from '../operations/runtime/submission';
 import {
@@ -152,6 +154,16 @@ async function* runShared(args: RunSharedArgs): AsyncGenerator<PBLSSEEvent, void
   const isMilestone = kind === 'milestone';
   let lastSanitizedLength = 0;
   try {
+    const safeImages = visionImageSrc
+      ? await prepareVisionImages([{ id: 'submission', src: visionImageSrc }], log)
+      : [];
+    if (visionImageSrc && safeImages.length === 0) {
+      log.warn('Image submission evaluated without the image', {
+        kind,
+        milestoneId,
+        microtaskId,
+      });
+    }
     const result = streamLLM(
       {
         model: languageModel,
@@ -159,14 +171,12 @@ async function* runShared(args: RunSharedArgs): AsyncGenerator<PBLSSEEvent, void
         // Image submission on a vision-capable model → send the picture as a
         // multimodal user turn (reusing OpenMAIC's buildVisionUserContent).
         // Everything else keeps the plain text prompt unchanged.
-        ...(visionImageSrc
+        ...(safeImages.length
           ? {
               messages: [
                 {
                   role: 'user' as const,
-                  content: buildVisionUserContent(userPrompt, [
-                    { id: 'submission', src: visionImageSrc },
-                  ]),
+                  content: buildVisionUserContent(userPrompt, safeImages),
                 },
               ],
             }
@@ -176,50 +186,26 @@ async function* runShared(args: RunSharedArgs): AsyncGenerator<PBLSSEEvent, void
       `pbl-v2-evaluator-${kind}`,
       thinkingConfig,
     );
-    for await (const part of result.fullStream) {
-      switch (part.type) {
-        case 'text-delta': {
-          // AI SDK 6.x uses `text` for the chunk content; fall back to
-          // legacy `textDelta` for safety with older provider shims.
-          const delta =
-            (part as unknown as { text?: string; textDelta?: string }).text ??
-            (part as unknown as { textDelta?: string }).textDelta ??
-            '';
-          if (delta) {
-            fullText += delta;
-            if (!shouldStreamTokens) {
-              break;
-            }
-            if (isMilestone) {
-              const sanitized = sanitizeMilestoneEvaluationFeedback(fullText);
-              const next = sanitized.slice(lastSanitizedLength);
-              if (next) {
-                yield { type: 'token', delta: next };
-                lastSanitizedLength = sanitized.length;
-              }
-              // When sanitized is shorter than fullText the LLM has
-              // started a disallowed section — stop yielding tokens
-              // but keep accumulating so the final evaluation still
-              // gets the complete text for structured-tail parsing.
-            } else {
-              yield { type: 'token', delta };
-            }
+    for await (const part of streamPBLParts(result.fullStream, 'LLM error')) {
+      if (part.type === 'error') {
+        yield part;
+        yield { type: 'done' };
+        return;
+      }
+      if (part.type !== 'token') continue;
+      fullText += part.delta;
+      if (shouldStreamTokens) {
+        if (isMilestone) {
+          const sanitized = sanitizeMilestoneEvaluationFeedback(fullText);
+          const next = sanitized.slice(lastSanitizedLength);
+          if (next) {
+            yield { type: 'token', delta: next };
+            lastSanitizedLength = sanitized.length;
           }
-          break;
+          // Keep accumulating hidden sections for structured-tail parsing.
+        } else {
+          yield part;
         }
-        case 'error': {
-          const errAny = (part as unknown as { error?: unknown }).error;
-          yield {
-            type: 'error',
-            code: 'LLM_ERROR',
-            message: errAny instanceof Error ? errAny.message : String(errAny ?? 'LLM error'),
-          };
-          yield { type: 'done' };
-          return;
-        }
-        case 'finish':
-        default:
-          break;
       }
     }
   } catch (err) {
